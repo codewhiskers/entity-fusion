@@ -165,11 +165,12 @@ class CompanyCleaner:
 
         join_split_columns(ending_count)
         filter_out_columns()
-        pdb.set_trace()
+        
         # Second pass for 1-word endings
         count = 1
         old_column_name = f'{self.column_name}_CLN'
-        new_column_name = f'{self.cleaned_column_name}_second_pass'
+        # new_column_name = f'{self.cleaned_column_name}_second_pass'
+        self.cleaned_column_name = old_column_name
 
         logging.info(f'Second pass for removing most common {count}-word endings')
         common_endings = get_most_common_endings(count)
@@ -189,7 +190,7 @@ class CompanyCleaner:
 
         idx_exceptions = [*set(idx_exceptions_2 + idx_exceptions_3)]
         idx_non_exceptions = self.df.index.difference(idx_exceptions).tolist()
-        
+        pdb.set_trace()
         remove_common_endings(common_endings, idx_non_exceptions, old_column_name, new_column_name)
         populate_column_for_removed_endings(idx_non_exceptions, count, old_column_name, new_column_name)
         pdb.set_trace()
