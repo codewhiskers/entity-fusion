@@ -45,9 +45,9 @@ class CompanyCleaner:
         # self.df[self.cleaned_column_name + '_4' ] = self.df[self.cleaned_column_name].copy() # fix this
         # self.df[self.cleaned_column_name + '_4' ] = None # fix this
 
-        def get_most_common_endings(count):
+        def get_most_common_endings(count, old_column_name):
             # Extract the last word from each company name
-            endings = self.df[self.cleaned_column_name].str.split().str[-count:]
+            endings = self.df[old_column_name].str.split().str[-count:]
             endings = [' '.join(ending) for ending in endings]
             # Count occurrences of each ending
             ending_counts = Counter(endings)
@@ -108,30 +108,26 @@ class CompanyCleaner:
             return idx_exceptions_3
 
         def remove_common_endings(common_endings, idx_exceptions, old_column_name, new_column_name):
+            '''
+            Take the common endings and remove them from values that are not idx_exceptions. 
+            Save a new column for the values that have had the endings removed.
+            Returns a dataframe with the new "cleaned" column
+            '''
+            # Create a regex pattern to match common endings
             regex_pattern = r'\b' + r'$|\b'.join(common_endings) + r'$'
+            # Remove common endings from company names if they are not in the exceptions
             self.df.loc[idx_exceptions, new_column_name] = self.df.loc[idx_exceptions, old_column_name].str.replace(regex_pattern, '', regex=True).str.strip()
+            # Replace NaN values in the new column with the original company names
             self.df[new_column_name] = np.where(self.df[new_column_name].isnull(), self.df[old_column_name], self.df[new_column_name])
 
         def populate_column_for_removed_endings(idx_exceptions, count, old_column_name, new_column_name):
+            '''
+            Create a column to store the endings that were removed from the company names
+            '''
             self.df[f'{count}_word_ending_removed'] = None
             zipped_generator = zip(self.df.loc[idx_exceptions, new_column_name], self.df.loc[idx_exceptions, old_column_name])
             self.df.loc[idx_exceptions, f'{count}_word_ending_removed'] = [j.replace(i, '').strip('()') for i, j in zipped_generator]
             self.df[f'{count}_word_ending_removed']  = self.df[f'{count}_word_ending_removed'].replace('', None)
-
-        def join_split_columns(ending_count):
-            columns_to_join = [x for x in self.df.columns if re.search('word_ending_removed', x)][::-1]
-            self.df['joined_column'] = self.df.apply(lambda row: ' '.join([str(row[col]) for col in columns_to_join if row[col] is not None]), axis=1)
-            for count in range(1, ending_count + 1):
-                new_column = f'{count}-ending'
-                self.df[new_column] = self.df['joined_column'].apply(lambda x: x.split()[-count] if x and len(x.split()) >= count else np.nan)
-
-        def filter_out_columns():
-            # pdb.set_trace()
-            self.df.rename(columns={self.cleaned_column_name + '_1' : self.column_name + '_CLN'}, inplace=True)
-            columns_to_drop = [x for x in self.df.columns if 'removed' in x] + ['joined_column'] + ['string_length']
-            more_columns_to_drop = [x for x in self.df.columns if 'cleaned' in x]
-            self.df.drop(columns=columns_to_drop + more_columns_to_drop, inplace=True)
-            # pdb.set_trace()
 
         for count in range(ending_count, 0, -1):
             if count == ending_count:
@@ -142,7 +138,7 @@ class CompanyCleaner:
                 new_column_name = f'{self.cleaned_column_name}_{count}'
             
             logging.info(f'Beginning extraction for most common {count}-word endings')
-            common_endings = get_most_common_endings(count)
+            common_endings = get_most_common_endings(count, old_column_name)
             logging.info('Word Extraction Complete')
 
             logging.info(f'Creating exceptions for endings with less than {count} words')
@@ -163,38 +159,67 @@ class CompanyCleaner:
             remove_common_endings(common_endings, idx_non_exceptions, old_column_name, new_column_name)
             populate_column_for_removed_endings(idx_non_exceptions, count, old_column_name, new_column_name)
 
-        join_split_columns(ending_count)
-        filter_out_columns()
+        def create_ending_columns(ending_count):
+            '''
+            There is a method to the madness here. The main reason we're not just renaming the 
+            n-word endings to remove, is because we want to see the individual strings that were removed.
+            For example, if 'CONSTRUCTION INC' was a 2-word ending that was removed--we want to see
+            the 'INC' and the 'CONSTRUCTION' removed separately.
+            # NEED TO MAKE ENDING_COUNT GLOBAL OR SOMETHING HERE
+            '''
+            # Join the columns that were split to extract the endings
+            # pdb.set_trace()
+            columns_to_join = [x for x in self.df.columns if re.search('word_ending_removed', x)][::-1]
+            self.df['joined_column'] = self.df.apply(lambda row: ' '.join([str(row[col]) for col in columns_to_join if row[col] is not None]), axis=1)
+            for count in range(0, ending_count + 1):
+                new_column = f'{count}-ending'
+                count = count + 1 #this it to account for the 0-indexing
+                # Extract the nth word from the joined column
+                self.df[new_column] = self.df['joined_column'].apply(lambda x: x.split()[-count] if x and len(x.split()) >= count else np.nan)
+            # pdb.set_trace()
+            
+        def filter_out_columns():
+            self.df.rename(columns={self.cleaned_column_name + '_0' : self.column_name + '_CLN'}, inplace=True)
+            columns_to_drop = [x for x in self.df.columns if 'removed' in x] + ['joined_column'] + ['string_length']
+            more_columns_to_drop = [x for x in self.df.columns if 'cleaned' in x]
+            self.df.drop(columns=columns_to_drop + more_columns_to_drop, inplace=True)
+            pdb.set_trace()
+        
+        # create_ending_columns(ending_count)
+        # filter_out_columns()
         
         # Second pass for 1-word endings
         count = 1
-        old_column_name = f'{self.column_name}_CLN'
-        # new_column_name = f'{self.cleaned_column_name}_second_pass'
-        self.cleaned_column_name = old_column_name
+        old_column_name = f'{self.cleaned_column_name}_{count}'
+        new_column_name = f'{self.cleaned_column_name}_{count - 1}'
+        # self.cleaned_column_name = old_column_name
 
         logging.info(f'Second pass for removing most common {count}-word endings')
-        common_endings = get_most_common_endings(count)
+        common_endings = get_most_common_endings(count, old_column_name)
         logging.info('Word Extraction Complete')
-
-        logging.info(f'Creating exceptions for endings with less than {count} words')
+        
+        # logging.info(f'Creating exceptions for endings with less than {count} words')
         # idx_exceptions_1 = create_exception_1_index(count)
-        logging.info(f'There are {len(idx_exceptions_1)} {count}-word endings that will not be altered due to number of words in string.')
+        # logging.info(f'There are {len(idx_exceptions_1)} {count}-word endings that will not be altered due to number of words in string.')
 
         logging.info(f'Creating exceptions for endings that are next to prepositions.')
         idx_exceptions_2 = create_exception_2_index(count, old_column_name)
         logging.info(f'There are {len(idx_exceptions_2)} {count}-word endings that will not be altered due to proximity to a proposition.')
         
         logging.info(f'Creating exceptions for instances where remaining string length after ending removal is too small.')
-        idx_exceptions_3 = create_exception_3_index(count, old_column_name, 4)
+        idx_exceptions_3 = create_exception_3_index(count, old_column_name, string_length=4)
         logging.info(f'There are {len(idx_exceptions_3)} {count}-word endings that will not be altered due to length of remaining string.')
-
+        
         idx_exceptions = [*set(idx_exceptions_2 + idx_exceptions_3)]
         idx_non_exceptions = self.df.index.difference(idx_exceptions).tolist()
-        pdb.set_trace()
+        
         remove_common_endings(common_endings, idx_non_exceptions, old_column_name, new_column_name)
-        populate_column_for_removed_endings(idx_non_exceptions, count, old_column_name, new_column_name)
-        pdb.set_trace()
-        self.df['final_cleaned_column'] = np.where(self.df[new_column_name].notnull(), self.df[new_column_name], self.df[old_column_name])
+        populate_column_for_removed_endings(idx_non_exceptions, 0, old_column_name, new_column_name)
+        # pdb.set_trace()
+        create_ending_columns(ending_count)
+        filter_out_columns()
+        # pdb.set_trace()
+        # self.df['final_cleaned_column'] = np.where(self.df[new_column_name].notnull(), self.df[new_column_name], self.df[old_column_name])
 
         pdb.set_trace()
         return self.df
