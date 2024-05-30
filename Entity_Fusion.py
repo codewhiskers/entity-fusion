@@ -17,9 +17,10 @@ import re
 
 class Entity_Fusion:
     
-    def __init__(self, df, column_thresholds, post_clustered_df=None):
+    def __init__(self, df, column_thresholds, conditional='OR', post_clustered_df=None):
         self.df = df
         self.column_thresholds = column_thresholds
+        self.conditional = conditional
         self.post_clustered_df = post_clustered_df
         self.df_sim = None
         self.graph = None
@@ -58,7 +59,6 @@ class Entity_Fusion:
                 result.append(' ' + word)
             else:
                 result.append(' ' + word + ' ')
-        # pdb.set_trace()
         return result
 
     def _create_tfidf_matrix(self, data):
@@ -94,24 +94,21 @@ class Entity_Fusion:
         idf_scores = {term: score for term, score in idf_scores.items()}
         return idf_scores
 
-    def custom_tokenizer(self, text, common_affixes=None, tfidf_scores=None):
+    def custom_tokenizer(self, text, common_affixes=None):
         # pdb.set_trace()
         # words = text.split()
         words = self.split_string_with_spaces(text) 
         total_words = len(words)
         
         # Use a more gradual dropoff for shorter strings
-        # base = np.log(total_words + 1)  # Base for logarithmic scaling
-        # base = np.log(total_words + 1)  # Adjust the base to control the steepness
-        # word_weights = [1 for i in range(total_words)]
         base = np.log(total_words + 1)
         word_weights = [1 / (np.log(i + 1) + base) for i in range(1, total_words + 1)]
 
         weighted_tokens = []
         for word, weight in zip(words, word_weights):
             # Remove stopwords... 
-            if tfidf_scores is not None:
-                tfidf_weight = tfidf_scores.get(word, 1)
+            if self.tfidf_scores is not None:
+                tfidf_weight = self.tfidf_scores.get(word, 1)
                 weight *= tfidf_weight
 
             # Reduce weight for common postfixes
@@ -129,25 +126,33 @@ class Entity_Fusion:
                     
         return weighted_tokens
 
-    def _create_similarity_matrix(self, df, column_name, threshold):
-        data = df[column_name].tolist()
+    def _create_similarity_matrix(self, data, column_name, threshold):
+        # data = df[column_name].tolist()
         common_affixes = self.find_common_prefixes_and_postfixes(data)
-
-        tfidf_scores = self._create_tfidf_matrix(data)
 
         # Use CountVectorizer to create a term-frequency matrix with the custom tokenizer
         vectorizer = CountVectorizer(tokenizer=lambda text: self.custom_tokenizer(text, 
-                                                                                  common_affixes,
-                                                                                  tfidf_scores), 
+                                                                                  common_affixes), 
                                      preprocessor=None, lowercase=False)
-        X_counts = vectorizer.fit_transform(data)
+        if len(data) == 0 or all(len(d) == 0 for d in data):
+            return pd.DataFrame()  # Return an empty DataFrame if the data is empty
+
+        try:
+            X_counts = vectorizer.fit_transform(data)
+        except ValueError as e:
+            if 'empty vocabulary' in str(e):
+                return pd.DataFrame()  # Return an empty DataFrame if the vocabulary is empty
+            else:
+                raise e
 
         # Transform the term-frequency matrix to a tf-idf representation
         tfidf_transformer = TfidfTransformer(norm='l2', smooth_idf=True)
         X_tfidf = tfidf_transformer.fit_transform(X_counts)
 
         n_features = X_tfidf.shape[1]
+        print(n_features)
         n_features = 1000 if n_features > 2000 else n_features
+        print(n_features)
         svd = TruncatedSVD(n_components=n_features)
         X_reduced = svd.fit_transform(X_tfidf)
 
@@ -193,8 +198,19 @@ class Entity_Fusion:
     def create_similarity_matrices(self):
         processed_dfs = []
         for column, threshold in self.column_thresholds.items():
-            processed_df = self._create_similarity_matrix(self.df, column, threshold)
-            processed_dfs.append(processed_df)
+            data = self.df[column].tolist()
+            self.tfidf_scores = self._create_tfidf_matrix(data)
+            
+            grouped_processed_dfs = pd.DataFrame()
+            grouped_data = self.df.groupby(self.df[column].str[0])
+            for _, group in grouped_data:
+                pdb.set_trace()
+                grouped_processed_df = self._create_similarity_matrix(group, column, threshold)
+                grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df])
+                # processed_dfs.append(processed_df)
+            processed_dfs.append(grouped_processed_dfs)
+            # processed_df = self._create_similarity_matrix(data, column, threshold)
+            # processed_dfs.append(processed_df)
             
         def merge_dataframes(left_df, right_df, left_col, right_col):
             return pd.merge(
@@ -222,7 +238,14 @@ class Entity_Fusion:
         for _, row in self.df_sim.iterrows():
             idx1 = int(row["idx1"])
             idx2 = int(row["idx2"])
-            condition = any(row[f"{col}_similarity"] > threshold for col, threshold in self.column_thresholds.items())
+
+            # Evaluate conditions based on the specified logic (AND/OR)
+            conditions = [row[f"{col}_similarity"] > threshold for col, threshold in self.column_thresholds.items()]
+            if self.conditional == 'AND':
+                condition = all(conditions)
+            else:  # self.conditional == 'OR'
+                condition = any(conditions)
+
             if condition:
                 G.add_edge(idx1, idx2)
         self.graph = G
@@ -236,28 +259,6 @@ class Entity_Fusion:
                 cluster_map[node] = cluster_id
         self.clusters = cluster_map
         return cluster_map
-    
-    def add_pre_clustered_data(self, pre_clustered_df):
-        pre_clustered_map = {}
-        for column in self.column_thresholds.keys():
-            column_map = pre_clustered_df.set_index(column)['cluster_label'].to_dict()
-            pre_clustered_map[column] = column_map
-
-        def map_pre_clusters(row):
-            for column in self.column_thresholds.keys():
-                if row[column] in pre_clustered_map[column]:
-                    return pre_clustered_map[column][row[column]]
-            return None
-
-        self.df['pre_cluster_label'] = self.df.apply(map_pre_clusters, axis=1)
-        self.df['cluster_label'] = self.df['pre_cluster_label'].combine_first(self.df.index.map(self.clusters))
-        self.df_sim['pre_cluster_label'] = self.df_sim['idx1'].map(self.df['pre_cluster_label'])
-        self.df_sim['cluster_label'] = self.df_sim['pre_cluster_label'].combine_first(self.df_sim['idx1'].map(self.clusters))
-    
-    def add_post_clustered_data(self, df, post_clustered_df):
-        post_clustered_df['cluster_label'] = post_clustered_df['cluster_label'].apply(lambda x: f"M-{x}")
-        df = pd.merge(df, post_clustered_df, how='left')
-        return df
     
     def update_clusters_with_post_clustered(self, df_post_clustered):
         # Define key columns (all except the last column which is assumed to be 'cluster_label')
@@ -283,28 +284,37 @@ class Entity_Fusion:
         # Update the cluster labels in the similarity matrix
         # self.df_sim['cluster_label'] = self.df_sim['idx1'].map(self.df['cluster_label'])
 
-        
-    
     def cluster_data(self):
         self.create_similarity_matrices()
         self._construct_similarity_graph()
         self._find_clusters()
+        # pdb.set_trace()
         self.df["cluster_label"] = self.df.index.map(self.clusters)
         if self.post_clustered_df is not None:
             self.update_clusters_with_post_clustered(self.post_clustered_df)
+        
+        # self.df_sim['cluster_label'] = self.df_sim['idx1'].map(self.df['cluster_label'])
         return self.df
     
     def return_cluster_data_logic_dataframe(self):
         # Reset index for the original DataFrame
         original_df = self.df.reset_index()
         for column in self.column_thresholds.keys():
-            # Create a mapping dictionary
             index_to_col = original_df.set_index("index")[column].to_dict()
-            # Replace idx1 and idx2 with the corresponding column values
             self.df_sim[f"{column}_idx1"] = self.df_sim["idx1"].map(index_to_col)
-            self.df_sim[f"{column}_idx2"] = self.df_sim["idx2"].map(index_to_col)  
+            self.df_sim[f"{column}_idx2"] = self.df_sim["idx2"].map(index_to_col)
             
-        self.df_sim['cluster_label'] = self.df_sim['idx1'].map(self.clusters)
+        # Map cluster labels for both idx1 and idx2
+        self.df_sim['cluster_label_idx1'] = self.df_sim['idx1'].map(self.clusters)
+        self.df_sim['cluster_label_idx2'] = self.df_sim['idx2'].map(self.clusters)
+        
+        # Create a new column that maps the cluster label if both idx1 and idx2 have the same cluster label
+        self.df_sim['cluster_label'] = self.df_sim.apply(
+            lambda row: row['cluster_label_idx1'] if row['cluster_label_idx1'] == row['cluster_label_idx2'] else None,
+            axis=1
+        )
+        self.df_sim.drop(columns=['cluster_label_idx1', 'cluster_label_idx2'], inplace=True)
+        pdb.set_trace()
         return self.df_sim
     
     
