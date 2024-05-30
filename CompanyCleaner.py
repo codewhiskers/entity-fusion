@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 class CompanyCleaner:
     def __init__(self, dataframe: pd.DataFrame, column_name: str) -> None:
         """Initialize the CompanyCleaner object with a pandas DataFrame and a column name containing company names."""
-        self.df = dataframe[0:1_000].copy()  # DataFrame containing the data
+        self.df = dataframe#[0:1_000].copy()  # DataFrame containing the data
         # self.df.drop_duplicates([column_name], inplace=True)
         # self.df = self.df.sample(n=100_000, random_state=42)
         self.column_name = column_name  # Column name containing company names
@@ -39,7 +39,7 @@ class CompanyCleaner:
             lambda x: self._normalize_whitespace(self._remove_punctuation(x))
         )
 
-    def _get_common_endings_and_remove(self, ending_count) -> pd.DataFrame:
+    def _get_common_endings_and_remove(self, ending_count, occurrence_count) -> pd.DataFrame:
         """Identify common endings in company names based on a minimum occurrence count."""
         # Create columns that will be 
         # self.df[self.cleaned_column_name + '_4' ] = self.df[self.cleaned_column_name].copy() # fix this
@@ -52,7 +52,7 @@ class CompanyCleaner:
             # Count occurrences of each ending
             ending_counts = Counter(endings)
             # Filter endings by minimum count # use a frequency % or some other statistical count for this
-            common_endings = [ending for ending, count in ending_counts.items() if count >= 5]
+            common_endings = [ending for ending, count in ending_counts.items() if count >= occurrence_count]
             return common_endings
 
         def create_exception_0_index():
@@ -100,7 +100,11 @@ class CompanyCleaner:
             return idx_exceptions_2
 
         def create_exception_3_index(count, old_column_name, string_length=10):
-            # if count == 1:
+            '''
+            So this is looking at the length of the remaining string if the ending is removed.
+            If the remaining string is length than the 'string_length' variable, then it's untouched. 
+            '''
+            # if count == 3:
             #     pdb.set_trace()
             self.df['string_length'] = self.df[old_column_name].apply(lambda x: len(' '.join(x.split()[:-count]) if len(x.split()) > count else ''))
             masked_exception = self.df['string_length'] < string_length
@@ -124,6 +128,7 @@ class CompanyCleaner:
             '''
             Create a column to store the endings that were removed from the company names
             '''
+            
             self.df[f'{count}_word_ending_removed'] = None
             zipped_generator = zip(self.df.loc[idx_exceptions, new_column_name], self.df.loc[idx_exceptions, old_column_name])
             self.df.loc[idx_exceptions, f'{count}_word_ending_removed'] = [j.replace(i, '').strip('()') for i, j in zipped_generator]
@@ -150,7 +155,7 @@ class CompanyCleaner:
             logging.info(f'There are {len(idx_exceptions_2)} {count}-word endings that will not be altered due to proximity to a proposition.')
             
             logging.info(f'Creating exceptions for instances where remaining string length after ending removal is too small.')
-            idx_exceptions_3 = create_exception_3_index(count, old_column_name, 4)
+            idx_exceptions_3 = create_exception_3_index(count, old_column_name, string_length=15)
             logging.info(f'There are {len(idx_exceptions_3)} {count}-word endings that will not be altered due to length of remaining string.')
 
             idx_exceptions = [*set(idx_exceptions_1 + idx_exceptions_2 + idx_exceptions_3)]
@@ -170,23 +175,22 @@ class CompanyCleaner:
             # Join the columns that were split to extract the endings
             # pdb.set_trace()
             columns_to_join = [x for x in self.df.columns if re.search('word_ending_removed', x)][::-1]
-            self.df['joined_column'] = self.df.apply(lambda row: ' '.join([str(row[col]) for col in columns_to_join if row[col] is not None]), axis=1)
+            self.df['removed_endings'] = self.df.apply(lambda row: ' '.join([str(row[col]) for col in columns_to_join if row[col] is not None]), axis=1)
             for count in range(0, ending_count + 1):
                 new_column = f'{count}-ending'
                 count = count + 1 #this it to account for the 0-indexing
                 # Extract the nth word from the joined column
-                self.df[new_column] = self.df['joined_column'].apply(lambda x: x.split()[-count] if x and len(x.split()) >= count else np.nan)
+                self.df[new_column] = self.df['removed_endings'].apply(lambda x: x.split()[-count] if x and len(x.split()) >= count else np.nan)
             # pdb.set_trace()
             
         def filter_out_columns():
-            self.df.rename(columns={self.cleaned_column_name + '_0' : self.column_name + '_CLN'}, inplace=True)
-            columns_to_drop = [x for x in self.df.columns if 'removed' in x] + ['joined_column'] + ['string_length']
+            self.df.rename(columns={self.cleaned_column_name + '_1' : self.column_name + '_CLN'}, inplace=True)
+            columns_to_drop = [x for x in self.df.columns if 'removed' in x] + ['string_length'] # + ['removed_endings']
             more_columns_to_drop = [x for x in self.df.columns if 'cleaned' in x]
             self.df.drop(columns=columns_to_drop + more_columns_to_drop, inplace=True)
-            pdb.set_trace()
+            # self.df.drop(columns=[x for x in self.df.columns if '-ending' in x], inplace=True)
+            # pdb.set_trace()
         
-        # create_ending_columns(ending_count)
-        # filter_out_columns()
         
         # Second pass for 1-word endings
         count = 1
@@ -207,7 +211,7 @@ class CompanyCleaner:
         logging.info(f'There are {len(idx_exceptions_2)} {count}-word endings that will not be altered due to proximity to a proposition.')
         
         logging.info(f'Creating exceptions for instances where remaining string length after ending removal is too small.')
-        idx_exceptions_3 = create_exception_3_index(count, old_column_name, string_length=4)
+        idx_exceptions_3 = create_exception_3_index(count, old_column_name, string_length=15)
         logging.info(f'There are {len(idx_exceptions_3)} {count}-word endings that will not be altered due to length of remaining string.')
         
         idx_exceptions = [*set(idx_exceptions_2 + idx_exceptions_3)]
@@ -218,10 +222,7 @@ class CompanyCleaner:
         # pdb.set_trace()
         create_ending_columns(ending_count)
         filter_out_columns()
-        # pdb.set_trace()
-        # self.df['final_cleaned_column'] = np.where(self.df[new_column_name].notnull(), self.df[new_column_name], self.df[old_column_name])
-
-        pdb.set_trace()
+        
         return self.df
 
 
@@ -232,5 +233,5 @@ class CompanyCleaner:
         self._perform_initial_cleaning()
         
         # Identify common endings in company names
-        df = self._get_common_endings_and_remove(3)
+        df = self._get_common_endings_and_remove(3, occurrence_count=20)
         return df
