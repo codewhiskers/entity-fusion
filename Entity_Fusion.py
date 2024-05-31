@@ -273,9 +273,9 @@ class Entity_Fusion:
 
         # Use the final mask to filter the DataFrame
         filtered_df = self.df_sim[final_mask]
-
+        tqdm.pandas()
         # Add edges to the graph with a progress bar
-        edges = filtered_df.apply(lambda row: (int(row["idx1"]), int(row["idx2"])), axis=1)
+        edges = filtered_df.progress_apply(lambda row: (int(row["idx1"]), int(row["idx2"])), axis=1)
         for edge in tqdm(edges, desc="Adding edges to the graph"):
             G.add_edge(*edge)
 
@@ -286,7 +286,7 @@ class Entity_Fusion:
     def _find_clusters(self):
         clusters = list(nx.connected_components(self.graph))
         cluster_map = {}
-        for cluster_id, cluster in enumerate(clusters):
+        for cluster_id, cluster in enumerate(tqdm(clusters, desc="Finding clusters")):
             for node in cluster:
                 cluster_map[node] = cluster_id
         self.clusters = cluster_map
