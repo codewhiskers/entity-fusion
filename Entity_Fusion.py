@@ -123,9 +123,7 @@ class Entity_Fusion:
                 tokens = [word[i:i+3] for i in range(len(word) - 2)]
                 for token in tokens:
                     weighted_tokens.extend([token] * int(weight))# * 100))  # Adjust weight scaling as needed
-        # pdb.set_trace()
-        # if text == 'FNP INVESTMENTS':
-        #     pdb.set_trace()
+        
         return weighted_tokens
 
     def _create_similarity_matrix(self, group, column_name, threshold, similarity_method):
@@ -141,9 +139,6 @@ class Entity_Fusion:
                 f"{column_name}_similarity",
             ])
 
-        # if similarity_method == 'tfidf':
-            # Use CountVectorizer to create a term-frequency matrix with the custom tokenizer
-            # vectorizer = CountVectorizer(tokenizer=lambda text: self.custom_tokenizer(text), preprocessor=None, lowercase=False)
         if similarity_method in ['tfidf', 'numeric']:
             if similarity_method == 'tfidf':
                 vectorizer = CountVectorizer(tokenizer=lambda text: self.custom_tokenizer(text), preprocessor=None, lowercase=False)
@@ -155,14 +150,6 @@ class Entity_Fusion:
                 vectorizer = TfidfVectorizer(tokenizer=lambda x: re.findall(r'\d+', x), preprocessor=None, lowercase=False)
                 X_tfidf = vectorizer.fit_transform(data)
             
-            
-            # X_counts = vectorizer.fit_transform(data)
-            # # Transform the term-frequency matrix to a tf-idf representation
-            # tfidf_transformer = TfidfTransformer(norm='l2', smooth_idf=True, use_idf=True)
-            # X_tfidf = tfidf_transformer.fit_transform(X_counts)
-
-            # vectorizer = TfidfVectorizer(analyzer="word", norm=None, lowercase=False)
-            # X_tfidf = vectorizer.fit_transform(data)
             n_features = X_tfidf.shape[1]
             n_features = 1000 if n_features > 2000 else n_features - 1
             if n_features > 500:
@@ -312,9 +299,6 @@ class Entity_Fusion:
         
         # Clean up the key tuple column
         self.df.drop(columns=['key_tuple'], inplace=True)
-        
-        # Update the cluster labels in the similarity matrix
-        # self.df_sim['cluster_label'] = self.df_sim['idx1'].map(self.df['cluster_label'])
 
     def cluster_data(self):
         self.create_similarity_matrices()
@@ -324,8 +308,7 @@ class Entity_Fusion:
         self.df["cluster_label"] = self.df.index.map(self.clusters)
         if self.post_clustered_df is not None:
             self.update_clusters_with_post_clustered(self.post_clustered_df)
-        
-        # self.df_sim['cluster_label'] = self.df_sim['idx1'].map(self.df['cluster_label'])
+    
         return self.df
     
     def return_cluster_data_logic_dataframe(self):
@@ -348,7 +331,6 @@ class Entity_Fusion:
         self.df_sim.drop(columns=['cluster_label_idx1', 'cluster_label_idx2'], inplace=True)
         # pdb.set_trace()
         return self.df_sim
-    
     
     # Function to visualize a specific cluster interactively
     # def visualize_cluster(graph, clusters, cluster_id):
