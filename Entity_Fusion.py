@@ -260,18 +260,25 @@ class Entity_Fusion:
     def _construct_similarity_graph(self):
         print('Computing similarity graph...')
         G = nx.Graph()
-        for _, row in self.df_sim.iterrows():
-            idx1 = int(row["idx1"])
-            idx2 = int(row["idx2"])
 
-            # Evaluate conditions based on the specified logic (AND/OR)
-            conditions = [row[f"{col}_similarity"] >= params['threshold'] for col, params in self.column_thresholds.items()]
-            if self.conditional == 'AND':
-                condition = all(conditions)
-            else:  # self.conditional == 'OR'
-                condition = any(conditions)
-            if condition:
-                G.add_edge(idx1, idx2)
+        # Create boolean masks for the conditions
+        masks = []
+        for col, params in self.column_thresholds.items():
+            masks.append(self.df_sim[f"{col}_similarity"] >= params['threshold'])
+        
+        if self.conditional == 'AND':
+            final_mask = np.logical_and.reduce(masks)
+        else:  # self.conditional == 'OR'
+            final_mask = np.logical_or.reduce(masks)
+
+        # Use the final mask to filter the DataFrame
+        filtered_df = self.df_sim[final_mask]
+
+        # Add edges to the graph with a progress bar
+        edges = filtered_df.apply(lambda row: (int(row["idx1"]), int(row["idx2"])), axis=1)
+        for edge in tqdm(edges, desc="Adding edges to the graph"):
+            G.add_edge(*edge)
+
         self.graph = G
         print('Similarity graph constructed.')
         return G
