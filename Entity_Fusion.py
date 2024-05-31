@@ -27,25 +27,6 @@ class Entity_Fusion:
         self.clusters = None
         self.stopwords = set(ENGLISH_STOP_WORDS)
 
-    def levenshtein_distance(self, s1, s2):
-        if len(s1) < len(s2):
-            return self.levenshtein_distance(s2, s1)
-
-        if len(s2) == 0:
-            return len(s1)
-
-        previous_row = range(len(s2) + 1)
-        for i, c1 in enumerate(s1):
-            current_row = [i + 1]
-            for j, c2 in enumerate(s2):
-                insertions = previous_row[j + 1] + 1
-                deletions = current_row[j] + 1
-                substitutions = previous_row[j] + (c1 != c2)
-                current_row.append(min(insertions, deletions, substitutions))
-            previous_row = current_row
-
-        return previous_row[-1]
-
     def levenshtein_similarity(self, a, b):
         max_len = max(len(a), len(b))
         if max_len == 0:
@@ -217,16 +198,6 @@ class Entity_Fusion:
                 if i != j:
                     all_similarities.append([original_indices[i], original_indices[j], value])  # Use original indices
         
-        # elif similarity_method == 'levenshtein':
-        #     all_similarities = []
-        #     desc = f"Computing Levenshtein similarities for {column_name}"
-        #     for i in tqdm(range(len(data)), desc=desc):
-        #         for j in range(i + 1, len(data)):
-        #             similarity = self.levenshtein_similarity(data[i], data[j])
-        #             if similarity >= threshold:
-        #                 all_similarities.append([original_indices[i], original_indices[j], similarity])
-
-        
         sim_df = pd.DataFrame(
             all_similarities,
             columns=[
@@ -235,8 +206,6 @@ class Entity_Fusion:
                 f"{column_name}_similarity",
             ],
         )
-        # if '45-3263936' in data:
-        #     pdb.set_trace()
         return sim_df
     
 
