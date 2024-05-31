@@ -18,7 +18,7 @@ import re
 class Entity_Fusion:
     
     def __init__(self, df, column_thresholds, conditional='OR', post_clustered_df=None):
-        self.df = df
+        self.df = df.reset_index(drop=True)
         self.column_thresholds = column_thresholds
         self.conditional = conditional
         self.post_clustered_df = post_clustered_df
@@ -27,6 +27,30 @@ class Entity_Fusion:
         self.clusters = None
         self.stopwords = set(ENGLISH_STOP_WORDS)
 
+    def levenshtein_distance(self, s1, s2):
+        if len(s1) < len(s2):
+            return self.levenshtein_distance(s2, s1)
+
+        if len(s2) == 0:
+            return len(s1)
+
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+
+        return previous_row[-1]
+
+    def levenshtein_similarity(self, a, b):
+        max_len = max(len(a), len(b))
+        if max_len == 0:
+            return 1.0
+        return (max_len - self.levenshtein_distance(a, b)) / max_len
 
     def find_common_prefixes_and_postfixes(self, data, min_length=2):
         threshold = 5
@@ -69,24 +93,9 @@ class Entity_Fusion:
             sublinear_tf=True,
             norm=None
         )
-        # X_tfidf = vectorizer.fit_transform(data)
-        # feature_names = vectorizer.get_feature_names_out()
-        # tfidf_scores = dict(zip(feature_names, X_tfidf.mean(axis=0).tolist()[0]))
-        # scaling_factor = 5  # Choose a factor to scale up the scores
-        # tfidf_scores = {term: score * scaling_factor for term, score in tfidf_scores.items()}
-        # Print term frequencies
-        # term_frequencies = X_tfidf.sum(axis=0).A1
-        # term_frequencies_dict = dict(zip(feature_names, term_frequencies))
-
-        # # Print document frequencies
-        # document_frequencies = (X_tfidf > 0).sum(axis=0).A1
-        # document_frequencies_dict = dict(zip(feature_names, document_frequencies))
-        
         vectorizer.fit(data)
-
         # Get feature names
         feature_names = vectorizer.get_feature_names_out()
-
         # Get IDF values
         idf_values = vectorizer.idf_
         idf_scores = dict(zip(feature_names, idf_values))
@@ -94,97 +103,130 @@ class Entity_Fusion:
         idf_scores = {term: score for term, score in idf_scores.items()}
         return idf_scores
 
-    def custom_tokenizer(self, text, common_affixes=None):
+    def custom_tokenizer(self, text):
         # pdb.set_trace()
         # words = text.split()
+        # pdb.set_trace()
         words = self.split_string_with_spaces(text) 
         total_words = len(words)
         
         # Use a more gradual dropoff for shorter strings
         base = np.log(total_words + 1)
-        word_weights = [1 / (np.log(i + 1) + base) for i in range(1, total_words + 1)]
+        
+        # Calculate initial weights using logarithm and base
+        initial_weights = [1 / (np.log(i + 1) + base) ** 2 for i in range(1, total_words + 1)]
+        
+        # Normalize weights so that the first weight is 1
+        first_weight = initial_weights[0]
+        word_weights = [weight / first_weight for weight in initial_weights]
+        word_weights = [1 for i in range(1, total_words + 1)]
 
         weighted_tokens = []
         for word, weight in zip(words, word_weights):
             # Remove stopwords... 
+            if word.lower().strip() in self.stopwords:
+                continue
             if self.tfidf_scores is not None:
                 tfidf_weight = self.tfidf_scores.get(word, 1)
                 weight *= tfidf_weight
 
             # Reduce weight for common postfixes
-            if word.strip() in common_affixes:
+            if word.strip() in self.common_affixes:
                 if word == words[-1]:
                     weight *= 0.5
                 if word == words[0]:
                     weight *= 0.5
                     
             # Generate 2-word and 3-word tokens including spaces
-            if len(word) > 1:  # Ensure the word length is valid for bi-gram generation
-                tokens = [word[i:i+2] for i in range(len(word) - 1)]
+            if len(word) > 2:  # Ensure the word length is valid for bi-gram generation
+                tokens = [word[i:i+3] for i in range(len(word) - 2)]
                 for token in tokens:
                     weighted_tokens.extend([token] * int(weight))# * 100))  # Adjust weight scaling as needed
-                    
+        # pdb.set_trace()
+        # if text == 'FNP INVESTMENTS':
+        #     pdb.set_trace()
         return weighted_tokens
 
-    def _create_similarity_matrix(self, data, column_name, threshold):
-        # data = df[column_name].tolist()
-        common_affixes = self.find_common_prefixes_and_postfixes(data)
+    def _create_similarity_matrix(self, group, column_name, threshold, similarity_method):
+        group[column_name] = group[column_name].astype(str) #REMOVE NONETYPES OR SOMETHING
+        data = group[column_name].tolist()
+        original_indices = group.index.tolist()  # Keep track of the original indices
 
-        # Use CountVectorizer to create a term-frequency matrix with the custom tokenizer
-        vectorizer = CountVectorizer(tokenizer=lambda text: self.custom_tokenizer(text, 
-                                                                                  common_affixes), 
-                                     preprocessor=None, lowercase=False)
-        if len(data) == 0 or all(len(d) == 0 for d in data):
-            return pd.DataFrame()  # Return an empty DataFrame if the data is empty
+        if len(data) <= 1:
+            # Skip processing for groups with only one row
+            return pd.DataFrame(columns=[
+                f"{column_name}_1_index",
+                f"{column_name}_2_index",
+                f"{column_name}_similarity",
+            ])
 
-        try:
-            X_counts = vectorizer.fit_transform(data)
-        except ValueError as e:
-            if 'empty vocabulary' in str(e):
-                return pd.DataFrame()  # Return an empty DataFrame if the vocabulary is empty
-            else:
-                raise e
+        # if similarity_method == 'tfidf':
+            # Use CountVectorizer to create a term-frequency matrix with the custom tokenizer
+            # vectorizer = CountVectorizer(tokenizer=lambda text: self.custom_tokenizer(text), preprocessor=None, lowercase=False)
+        if similarity_method in ['tfidf', 'numeric']:
+            if similarity_method == 'tfidf':
+                vectorizer = CountVectorizer(tokenizer=lambda text: self.custom_tokenizer(text), preprocessor=None, lowercase=False)
+                X_counts = vectorizer.fit_transform(data)
+                # Transform the term-frequency matrix to a tf-idf representation
+                tfidf_transformer = TfidfTransformer(norm='l2', smooth_idf=True, use_idf=True)
+                X_tfidf = tfidf_transformer.fit_transform(X_counts)
+            elif similarity_method == 'numeric':
+                vectorizer = TfidfVectorizer(tokenizer=lambda x: re.findall(r'\d+', x), preprocessor=None, lowercase=False)
+                X_tfidf = vectorizer.fit_transform(data)
+            
+            
+            # X_counts = vectorizer.fit_transform(data)
+            # # Transform the term-frequency matrix to a tf-idf representation
+            # tfidf_transformer = TfidfTransformer(norm='l2', smooth_idf=True, use_idf=True)
+            # X_tfidf = tfidf_transformer.fit_transform(X_counts)
 
-        # Transform the term-frequency matrix to a tf-idf representation
-        tfidf_transformer = TfidfTransformer(norm='l2', smooth_idf=True)
-        X_tfidf = tfidf_transformer.fit_transform(X_counts)
+            # vectorizer = TfidfVectorizer(analyzer="word", norm=None, lowercase=False)
+            # X_tfidf = vectorizer.fit_transform(data)
+            n_features = X_tfidf.shape[1]
+            n_features = 1000 if n_features > 2000 else n_features - 1
+            if n_features > 500:
+                svd = TruncatedSVD(n_components=n_features)
+                X_tfidf = svd.fit_transform(X_tfidf)
 
-        n_features = X_tfidf.shape[1]
-        print(n_features)
-        n_features = 1000 if n_features > 2000 else n_features
-        print(n_features)
-        svd = TruncatedSVD(n_components=n_features)
-        X_reduced = svd.fit_transform(X_tfidf)
+            def compute_cosine_similarity_chunk(start_idx, end_idx, X_reduced, threshold):
+                chunk_matrix = cosine_similarity(X_reduced[start_idx:end_idx], X_reduced)
+                mask = chunk_matrix >= threshold
+                chunk_matrix = np.where(mask, chunk_matrix, 0)
+                return start_idx, end_idx, chunk_matrix
 
-        def compute_cosine_similarity_chunk(start_idx, end_idx, X_reduced, threshold):
-            chunk_matrix = cosine_similarity(X_reduced[start_idx:end_idx], X_reduced)
-            mask = chunk_matrix >= threshold
-            chunk_matrix = np.where(mask, chunk_matrix, 0)
-            return start_idx, end_idx, chunk_matrix
+            chunk_size = 500
+            n_samples = X_tfidf.shape[0]
+            cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
+            cos_sim_desc = f"Computing cosine similarity in chunks for {column_name}"
+            for start_idx in tqdm(range(0, n_samples, chunk_size), desc=cos_sim_desc):
+                end_idx = min(start_idx + chunk_size, n_samples)
+                start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, X_tfidf, threshold)
+                cos_sim_sparse[start_idx:end_idx] = chunk_matrix
+            cos_sim_sparse = cos_sim_sparse.tocsr()
 
-        chunk_size = 500
-        n_samples = X_reduced.shape[0]
-        cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
-        cos_sim_desc = f"Computing cosine similarity in chunks for {column_name}"
-        for start_idx in tqdm(range(0, n_samples, chunk_size), desc=cos_sim_desc):
-            end_idx = min(start_idx + chunk_size, n_samples)
-            start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, X_reduced, threshold)
-            cos_sim_sparse[start_idx:end_idx] = chunk_matrix
-        cos_sim_sparse = cos_sim_sparse.tocsr()
+            coo = coo_matrix(cos_sim_sparse)
+            rows, cols, values = coo.row, coo.col, coo.data
 
-        coo = coo_matrix(cos_sim_sparse)
-        rows, cols, values = coo.row, coo.col, coo.data
+            process_sim_desc = f"Processing similarities for {column_name}"
+            all_similarities = []
+            for i, j, value in tqdm(
+                zip(rows, cols, values),
+                total=len(values),
+                desc=process_sim_desc,
+            ):
+                if i != j:
+                    all_similarities.append([original_indices[i], original_indices[j], value])  # Use original indices
+        
+        # elif similarity_method == 'levenshtein':
+        #     all_similarities = []
+        #     desc = f"Computing Levenshtein similarities for {column_name}"
+        #     for i in tqdm(range(len(data)), desc=desc):
+        #         for j in range(i + 1, len(data)):
+        #             similarity = self.levenshtein_similarity(data[i], data[j])
+        #             if similarity >= threshold:
+        #                 all_similarities.append([original_indices[i], original_indices[j], similarity])
 
-        process_sim_desc = f"Processing similarities for {column_name}"
-        all_similarities = []
-        for i, j, value in tqdm(
-            zip(rows, cols, values),
-            total=len(values),
-            desc=process_sim_desc,
-        ):
-            if i != j:
-                all_similarities.append([i, j, value])
-
+        
         sim_df = pd.DataFrame(
             all_similarities,
             columns=[
@@ -193,25 +235,46 @@ class Entity_Fusion:
                 f"{column_name}_similarity",
             ],
         )
+        # if '45-3263936' in data:
+        #     pdb.set_trace()
         return sim_df
     
+
     def create_similarity_matrices(self):
         processed_dfs = []
-        for column, threshold in self.column_thresholds.items():
+        for column, params in self.column_thresholds.items():
+            threshold = params['threshold']
+            similarity_method = params.get('similarity_method', 'tfidf')
             data = self.df[column].tolist()
-            self.tfidf_scores = self._create_tfidf_matrix(data)
-            
+            if similarity_method == 'tfidf':
+                self.tfidf_scores = self._create_tfidf_matrix(data)
+                self.common_affixes = self.find_common_prefixes_and_postfixes(data)
             grouped_processed_dfs = pd.DataFrame()
-            grouped_data = self.df.groupby(self.df[column].str[0])
-            for _, group in grouped_data:
-                pdb.set_trace()
-                grouped_processed_df = self._create_similarity_matrix(group, column, threshold)
+
+            if params.get('block', False):
+                grouped_data = [self.df]
+                for criterion in params['criteria']:
+                    new_groups = []
+                    for group in grouped_data:
+                        if criterion == 'first_letter':
+                            new_groups.extend(list(group.groupby(group[column].str[0])))
+                        elif criterion == 'blocking_column':
+                            block_column = params.get('blocking_column')
+                            new_groups.extend(list(group.groupby(group[block_column])))
+                        else:
+                            raise ValueError(f"Unsupported criterion: {criterion}")
+                    grouped_data = [grp for _, grp in new_groups]
+
+                for group in grouped_data:
+                    if len(group) > 1:
+                        grouped_processed_df = self._create_similarity_matrix(group, column, threshold, similarity_method)
+                        grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df])
+            else:
+                grouped_processed_df = self._create_similarity_matrix(self.df, column, threshold, similarity_method)
                 grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df])
-                # processed_dfs.append(processed_df)
+
             processed_dfs.append(grouped_processed_dfs)
-            # processed_df = self._create_similarity_matrix(data, column, threshold)
-            # processed_dfs.append(processed_df)
-            
+        # pdb.set_trace()
         def merge_dataframes(left_df, right_df, left_col, right_col):
             return pd.merge(
                 left_df,
@@ -221,18 +284,19 @@ class Entity_Fusion:
                 how="outer",
                 suffixes=(f"_{left_col}", f"_{right_col}")
             )
-        # pdb.set_trace()
+            
         column_names = list(self.column_thresholds.keys())
         df_sim = reduce(lambda left, right: merge_dataframes(left, right, column_names[0], column_names[1]), processed_dfs)
         for i in range(1, 3):
             columns_to_check = [x for x in df_sim.columns if f"{i}_index" in x]
             df_sim[f"idx{i}"] = df_sim[columns_to_check].bfill(axis=1).iloc[:, 0]
             df_sim.drop(columns=columns_to_check, inplace=True)
-        # pdb.set_trace()
+        
         df_sim = df_sim.fillna(0)
         self.df_sim = df_sim
         return df_sim
-        
+
+
     def _construct_similarity_graph(self):
         G = nx.Graph()
         for _, row in self.df_sim.iterrows():
@@ -240,12 +304,11 @@ class Entity_Fusion:
             idx2 = int(row["idx2"])
 
             # Evaluate conditions based on the specified logic (AND/OR)
-            conditions = [row[f"{col}_similarity"] > threshold for col, threshold in self.column_thresholds.items()]
+            conditions = [row[f"{col}_similarity"] >= params['threshold'] for col, params in self.column_thresholds.items()]
             if self.conditional == 'AND':
                 condition = all(conditions)
             else:  # self.conditional == 'OR'
                 condition = any(conditions)
-
             if condition:
                 G.add_edge(idx1, idx2)
         self.graph = G
@@ -314,7 +377,7 @@ class Entity_Fusion:
             axis=1
         )
         self.df_sim.drop(columns=['cluster_label_idx1', 'cluster_label_idx2'], inplace=True)
-        pdb.set_trace()
+        # pdb.set_trace()
         return self.df_sim
     
     
@@ -387,70 +450,3 @@ class Entity_Fusion:
                             yaxis=dict(showgrid=False, zeroline=False, showticklabels=False))
                         )
         fig.show()
-        
-        
-#     def _create_similarity_matrix(self, df, column_name, threshold):
-        # data = df[column_name].tolist()
-
-        # def custom_tokenizer(text):
-        #     words = text.split()
-        #     word_weights = [(1 / (i + 1)) for i in range(len(words))]  # Custom word-level weighting
-        #     weighted_tokens = []
-        #     for word, weight in zip(words, word_weights):
-        #         tokens = [word[i:i+2] for i in range(len(word) - 1)]
-        #         for token in tokens:
-        #             weighted_tokens.extend([token] * int(weight * 100))  # Adjust weight scaling as needed
-        #     return weighted_tokens
-
-
-        # # Use CountVectorizer to create a term-frequency matrix with the custom tokenizer
-        # vectorizer = CountVectorizer(tokenizer=custom_tokenizer, preprocessor=None, lowercase=False)
-        # X_counts = vectorizer.fit_transform(data)
-
-        # # Transform the term-frequency matrix to a tf-idf representation
-        # tfidf_transformer = TfidfTransformer(norm='l2', smooth_idf=True)
-        # X_tfidf = tfidf_transformer.fit_transform(X_counts)
-
-        # n_features = X_tfidf.shape[1]
-        # n_features = 1000 if n_features > 2000 else n_features
-        # svd = TruncatedSVD(n_components=n_features)
-        # X_reduced = svd.fit_transform(X_tfidf)
-
-        # def compute_cosine_similarity_chunk(start_idx, end_idx, X_reduced, threshold):
-        #     chunk_matrix = cosine_similarity(X_reduced[start_idx:end_idx], X_reduced)
-        #     mask = chunk_matrix >= threshold
-        #     chunk_matrix = np.where(mask, chunk_matrix, 0)
-        #     return start_idx, end_idx, chunk_matrix
-
-        # chunk_size = 500
-        # n_samples = X_reduced.shape[0]
-        # cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
-        # cos_sim_desc = f"Computing cosine similarity in chunks for {column_name}"
-        # for start_idx in tqdm(range(0, n_samples, chunk_size), desc=cos_sim_desc):
-        #     end_idx = min(start_idx + chunk_size, n_samples)
-        #     start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, X_reduced, threshold)
-        #     cos_sim_sparse[start_idx:end_idx] = chunk_matrix
-        # cos_sim_sparse = cos_sim_sparse.tocsr()
-
-        # coo = coo_matrix(cos_sim_sparse)
-        # rows, cols, values = coo.row, coo.col, coo.data
-
-        # process_sim_desc = f"Processing similarities for {column_name}"
-        # all_similarities = []
-        # for i, j, value in tqdm(
-        #     zip(rows, cols, values),
-        #     total=len(values),
-        #     desc=process_sim_desc,
-        # ):
-        #     if i != j:
-        #         all_similarities.append([i, j, value])
-
-        # sim_df = pd.DataFrame(
-        #     all_similarities,
-        #     columns=[
-        #         f"{column_name}_1_index",
-        #         f"{column_name}_2_index",
-        #         f"{column_name}_similarity",
-        #     ],
-        # )
-        # return sim_df
