@@ -13,6 +13,7 @@ import plotly.graph_objects as go
 from collections import Counter
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 import re
+from collections import deque
 
 
 class Entity_Fusion:
@@ -295,9 +296,9 @@ class Entity_Fusion:
     def _find_clusters(self):
         def bfs(graph, start_node, visited):
             cluster = set()
-            queue = [start_node]
+            queue = deque([start_node])
             while queue:
-                node = queue.pop(0)
+                node = queue.popleft()
                 if node not in visited:
                     visited.add(node)
                     cluster.add(node)
@@ -307,7 +308,9 @@ class Entity_Fusion:
         print('Finding clusters...')
         clusters = []
         visited = set()
-        for node in tqdm(self.graph.keys(), desc="Processing nodes"):
+        nodes = list(self.graph.keys())
+
+        for node in tqdm(nodes, desc="Processing nodes"):
             if node not in visited:
                 cluster = bfs(self.graph, node, visited)
                 clusters.append(cluster)
