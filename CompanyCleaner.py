@@ -155,7 +155,7 @@ class CompanyCleaner:
             logging.info(f'There are {len(idx_exceptions_2)} {count}-word endings that will not be altered due to proximity to a proposition.')
             
             logging.info(f'Creating exceptions for instances where remaining string length after ending removal is too small.')
-            idx_exceptions_3 = create_exception_3_index(count, old_column_name, string_length=15)
+            idx_exceptions_3 = create_exception_3_index(count, old_column_name, string_length=10)
             logging.info(f'There are {len(idx_exceptions_3)} {count}-word endings that will not be altered due to length of remaining string.')
 
             idx_exceptions = [*set(idx_exceptions_1 + idx_exceptions_2 + idx_exceptions_3)]
@@ -211,7 +211,7 @@ class CompanyCleaner:
         logging.info(f'There are {len(idx_exceptions_2)} {count}-word endings that will not be altered due to proximity to a proposition.')
         
         logging.info(f'Creating exceptions for instances where remaining string length after ending removal is too small.')
-        idx_exceptions_3 = create_exception_3_index(count, old_column_name, string_length=15)
+        idx_exceptions_3 = create_exception_3_index(count, old_column_name, string_length=10)
         logging.info(f'There are {len(idx_exceptions_3)} {count}-word endings that will not be altered due to length of remaining string.')
         
         idx_exceptions = [*set(idx_exceptions_2 + idx_exceptions_3)]
