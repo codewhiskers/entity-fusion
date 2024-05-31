@@ -259,7 +259,6 @@ class Entity_Fusion:
 
     def _construct_similarity_graph(self):
         print('Computing similarity graph...')
-        G = nx.Graph()
 
         # Create boolean masks for the conditions
         masks = []
@@ -273,23 +272,53 @@ class Entity_Fusion:
 
         # Use the final mask to filter the DataFrame
         filtered_df = self.df_sim[final_mask]
-        tqdm.pandas()
-        # Add edges to the graph with a progress bar
-        edges = filtered_df.progress_apply(lambda row: (int(row["idx1"]), int(row["idx2"])), axis=1)
-        for edge in tqdm(edges, desc="Adding edges to the graph"):
-            G.add_edge(*edge)
 
-        self.graph = G
+        # Extract edges using vectorized operations
+        idx1 = filtered_df["idx1"].astype(int)
+        idx2 = filtered_df["idx2"].astype(int)
+        edges = list(zip(idx1, idx2))
+
+        # Build the graph using a dictionary of sets for efficiency
+        graph_dict = {}
+        for idx1, idx2 in tqdm(edges, desc="Adding edges to the graph"):
+            if idx1 not in graph_dict:
+                graph_dict[idx1] = set()
+            if idx2 not in graph_dict:
+                graph_dict[idx2] = set()
+            graph_dict[idx1].add(idx2)
+            graph_dict[idx2].add(idx1)
+
+        self.graph = graph_dict
         print('Similarity graph constructed.')
-        return G
+        return graph_dict
     
     def _find_clusters(self):
-        clusters = list(nx.connected_components(self.graph))
+        def bfs(graph, start_node, visited):
+            cluster = set()
+            queue = [start_node]
+            while queue:
+                node = queue.pop(0)
+                if node not in visited:
+                    visited.add(node)
+                    cluster.add(node)
+                    queue.extend(graph[node] - visited)
+            return cluster
+
+        print('Finding clusters...')
+        clusters = []
+        visited = set()
+        for node in tqdm(self.graph.keys(), desc="Processing nodes"):
+            if node not in visited:
+                cluster = bfs(self.graph, node, visited)
+                clusters.append(cluster)
+
         cluster_map = {}
-        for cluster_id, cluster in enumerate(tqdm(clusters, desc="Finding clusters")):
+        for cluster_id, cluster in enumerate(clusters):
             for node in cluster:
                 cluster_map[node] = cluster_id
+
         self.clusters = cluster_map
+        print('Clusters found.')
         return cluster_map
     
     def update_clusters_with_post_clustered(self, df_post_clustered):
