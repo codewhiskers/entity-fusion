@@ -72,7 +72,8 @@ class Entity_Fusion:
             preprocessor=None,
             lowercase=False,
             sublinear_tf=True,
-            norm=None
+            norm=None,
+            token_pattern=None,
         )
         vectorizer.fit(data)
         # Get feature names
@@ -141,13 +142,13 @@ class Entity_Fusion:
 
         if similarity_method in ['tfidf', 'numeric']:
             if similarity_method == 'tfidf':
-                vectorizer = CountVectorizer(tokenizer=lambda text: self.custom_tokenizer(text), preprocessor=None, lowercase=False)
+                vectorizer = CountVectorizer(tokenizer=lambda text: self.custom_tokenizer(text), preprocessor=None, lowercase=False, token_pattern=None)
                 X_counts = vectorizer.fit_transform(data)
                 # Transform the term-frequency matrix to a tf-idf representation
                 tfidf_transformer = TfidfTransformer(norm='l2', smooth_idf=True, use_idf=True)
                 X_tfidf = tfidf_transformer.fit_transform(X_counts)
             elif similarity_method == 'numeric':
-                vectorizer = TfidfVectorizer(tokenizer=lambda x: re.findall(r'\d+', x), preprocessor=None, lowercase=False)
+                vectorizer = TfidfVectorizer(tokenizer=lambda x: re.findall(r'\d+', x), preprocessor=None, lowercase=False, token_pattern=None)
                 X_tfidf = vectorizer.fit_transform(data)
             
             n_features = X_tfidf.shape[1]
@@ -166,7 +167,7 @@ class Entity_Fusion:
             n_samples = X_tfidf.shape[0]
             cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
             cos_sim_desc = f"Computing cosine similarity in chunks for {column_name}"
-            for start_idx in tqdm(range(0, n_samples, chunk_size), desc=cos_sim_desc):
+            for start_idx in tqdm(range(0, n_samples, chunk_size), desc=cos_sim_desc, leave=False):
                 end_idx = min(start_idx + chunk_size, n_samples)
                 start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, X_tfidf, threshold)
                 cos_sim_sparse[start_idx:end_idx] = chunk_matrix
@@ -181,6 +182,7 @@ class Entity_Fusion:
                 zip(rows, cols, values),
                 total=len(values),
                 desc=process_sim_desc,
+                leave=False
             ):
                 if i != j:
                     all_similarities.append([original_indices[i], original_indices[j], value])  # Use original indices
@@ -221,13 +223,15 @@ class Entity_Fusion:
                             raise ValueError(f"Unsupported criterion: {criterion}")
                     grouped_data = [grp for _, grp in new_groups]
 
-                for group in grouped_data:
+                for group in tqdm(grouped_data):
                     if len(group) > 1:
                         grouped_processed_df = self._create_similarity_matrix(group, column, threshold, similarity_method)
-                        grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df])
+                        if not grouped_processed_df.empty:
+                            grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df])
             else:
                 grouped_processed_df = self._create_similarity_matrix(self.df, column, threshold, similarity_method)
-                grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df])
+                if not grouped_processed_df.empty:
+                    grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df])
 
             processed_dfs.append(grouped_processed_dfs)
         # pdb.set_trace()
@@ -254,6 +258,7 @@ class Entity_Fusion:
 
 
     def _construct_similarity_graph(self):
+        print('Computing similarity graph...')
         G = nx.Graph()
         for _, row in self.df_sim.iterrows():
             idx1 = int(row["idx1"])
@@ -268,6 +273,7 @@ class Entity_Fusion:
             if condition:
                 G.add_edge(idx1, idx2)
         self.graph = G
+        print('Similarity graph constructed.')
         return G
     
     def _find_clusters(self):
