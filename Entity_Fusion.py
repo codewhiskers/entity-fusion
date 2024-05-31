@@ -153,9 +153,15 @@ class Entity_Fusion:
                 X_tfidf = vectorizer.fit_transform(data)
             
             n_features = X_tfidf.shape[1]
-            n_features = 1000 if n_features > 2000 else n_features - 1
-            if n_features > 500:
-                svd = TruncatedSVD(n_components=n_features)
+            n_components = 1000
+            n_components = min(n_features - 1, n_components)
+            
+            try:
+                svd = TruncatedSVD(n_components=n_components, random_state=42)
+                X_tfidf = svd.fit_transform(X_tfidf)
+            except:
+                n_components = n_components // 2
+                svd = TruncatedSVD(n_components=n_components, random_state=42)  
                 X_tfidf = svd.fit_transform(X_tfidf)
 
             def compute_cosine_similarity_chunk(start_idx, end_idx, X_reduced, threshold):
@@ -357,24 +363,29 @@ class Entity_Fusion:
         return self.df
     
     def return_cluster_data_logic_dataframe(self):
+        print('Creating cluster data logic DataFrame...')
         # Reset index for the original DataFrame
         original_df = self.df.reset_index()
+
+        # Use a single loop to update idx1 and idx2 mappings and cluster labels
         for column in self.column_thresholds.keys():
-            index_to_col = original_df.set_index("index")[column].to_dict()
+            index_to_col = original_df.set_index("index")[column]
+            # Map the values in one go
             self.df_sim[f"{column}_idx1"] = self.df_sim["idx1"].map(index_to_col)
             self.df_sim[f"{column}_idx2"] = self.df_sim["idx2"].map(index_to_col)
             
         # Map cluster labels for both idx1 and idx2
         self.df_sim['cluster_label_idx1'] = self.df_sim['idx1'].map(self.clusters)
         self.df_sim['cluster_label_idx2'] = self.df_sim['idx2'].map(self.clusters)
-        
-        # Create a new column that maps the cluster label if both idx1 and idx2 have the same cluster label
-        self.df_sim['cluster_label'] = self.df_sim.apply(
-            lambda row: row['cluster_label_idx1'] if row['cluster_label_idx1'] == row['cluster_label_idx2'] else None,
-            axis=1
+
+        # Vectorized operation to create the new column
+        self.df_sim['cluster_label'] = np.where(
+            self.df_sim['cluster_label_idx1'] == self.df_sim['cluster_label_idx2'],
+            self.df_sim['cluster_label_idx1'],
+            None
         )
         self.df_sim.drop(columns=['cluster_label_idx1', 'cluster_label_idx2'], inplace=True)
-        # pdb.set_trace()
+        print('Cluster data logic DataFrame created.')
         return self.df_sim
     
     # Function to visualize a specific cluster interactively
