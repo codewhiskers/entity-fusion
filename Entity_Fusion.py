@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+np.seterr(divide='ignore', invalid='ignore') # need to fix this later
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer, TfidfTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
@@ -128,7 +129,7 @@ class Entity_Fusion:
         
         return weighted_tokens
 
-    def _create_similarity_matrix(self, group, column_name, threshold, similarity_method):
+    def _create_similarity_matrix(self, group, column_name, threshold, similarity_method, progress_bar=True):
         group[column_name] = group[column_name].astype(str) #REMOVE NONETYPES OR SOMETHING
         data = group[column_name].tolist()
         original_indices = group.index.tolist()  # Keep track of the original indices
@@ -189,26 +190,38 @@ class Entity_Fusion:
         n_samples = X_tfidf.shape[0]
         cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
         cos_sim_desc = f"Computing cosine similarity in chunks for {column_name}"
-        for start_idx in tqdm(range(0, n_samples, chunk_size), desc=cos_sim_desc, leave=False):
-            end_idx = min(start_idx + chunk_size, n_samples)
-            start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, X_tfidf, threshold)
-            cos_sim_sparse[start_idx:end_idx] = chunk_matrix
+        if progress_bar:
+            for start_idx in tqdm(range(0, n_samples, chunk_size), desc=cos_sim_desc, leave=False):
+                end_idx = min(start_idx + chunk_size, n_samples)
+                start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, X_tfidf, threshold)
+                cos_sim_sparse[start_idx:end_idx] = chunk_matrix
+        else:
+            for start_idx in range(0, n_samples, chunk_size):
+                end_idx = min(start_idx + chunk_size, n_samples)
+                start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, X_tfidf, threshold)
+                cos_sim_sparse[start_idx:end_idx] = chunk_matrix
+                
         cos_sim_sparse = cos_sim_sparse.tocsr()
 
         coo = coo_matrix(cos_sim_sparse)
         rows, cols, values = coo.row, coo.col, coo.data
+        if progress_bar:
+            process_sim_desc = f"Processing similarities for {column_name}"
+            all_similarities = []
+            for i, j, value in tqdm(
+                zip(rows, cols, values),
+                total=len(values),
+                desc=process_sim_desc,
+                leave=False
+            ):
+                if i != j:
+                    all_similarities.append([original_indices[i], original_indices[j], value])
+        else:
+            all_similarities = []
+            for i, j, value in zip(rows, cols, values):
+                if i != j:
+                    all_similarities.append([original_indices[i], original_indices[j], value])
 
-        process_sim_desc = f"Processing similarities for {column_name}"
-        all_similarities = []
-        for i, j, value in tqdm(
-            zip(rows, cols, values),
-            total=len(values),
-            desc=process_sim_desc,
-            leave=False
-        ):
-            if i != j:
-                all_similarities.append([original_indices[i], original_indices[j], value])  # Use original indices
-        
         sim_df = pd.DataFrame(
             all_similarities,
             columns=[
@@ -252,7 +265,7 @@ class Entity_Fusion:
 
                 for group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
                     if len(group) > 1:
-                        grouped_processed_df = self._create_similarity_matrix(group, column, threshold, similarity_method)
+                        grouped_processed_df = self._create_similarity_matrix(group, column, threshold, similarity_method, progress_bar=False)
                         if not grouped_processed_df.empty:
                             # Rename columns to a consistent format
                             grouped_processed_df.rename(columns={
@@ -267,7 +280,8 @@ class Entity_Fusion:
                                 "idx2",
                                 f"{column}_similarity",
                             ])
-                        grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
+                        if not grouped_processed_dfs.empty:
+                            grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
             else:
                 grouped_processed_df = self._create_similarity_matrix(self.df, column, threshold, similarity_method)
                 if not grouped_processed_df.empty:
@@ -285,7 +299,7 @@ class Entity_Fusion:
                         "idx2",
                         f"{column}_similarity",
                     ])
-                    
+                
                 grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
 
             processed_dfs.append(grouped_processed_dfs)
