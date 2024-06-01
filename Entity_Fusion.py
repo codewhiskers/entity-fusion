@@ -132,7 +132,6 @@ class Entity_Fusion:
         group[column_name] = group[column_name].astype(str) #REMOVE NONETYPES OR SOMETHING
         data = group[column_name].tolist()
         original_indices = group.index.tolist()  # Keep track of the original indices
-
         if len(data) <= 1:
             # Skip processing for groups with only one row
             return pd.DataFrame(columns=[
@@ -140,59 +139,75 @@ class Entity_Fusion:
                 f"{column_name}_2_index",
                 f"{column_name}_similarity",
             ])
-
-        if similarity_method in ['tfidf', 'numeric']:
-            if similarity_method == 'tfidf':
-                vectorizer = CountVectorizer(tokenizer=lambda text: self.custom_tokenizer(text), preprocessor=None, lowercase=False, token_pattern=None)
-                X_counts = vectorizer.fit_transform(data)
-                # Transform the term-frequency matrix to a tf-idf representation
-                tfidf_transformer = TfidfTransformer(norm='l2', smooth_idf=True, use_idf=True)
-                X_tfidf = tfidf_transformer.fit_transform(X_counts)
-            elif similarity_method == 'numeric':
-                vectorizer = TfidfVectorizer(tokenizer=lambda x: re.findall(r'\d+', x), preprocessor=None, lowercase=False, token_pattern=None)
-                X_tfidf = vectorizer.fit_transform(data)
-            
-            n_features = X_tfidf.shape[1]
-            n_components = 1000
-            n_components = min(n_features - 1, n_components)
-            
+        if similarity_method == 'tfidf':
+            vectorizer = CountVectorizer(tokenizer=lambda text: self.custom_tokenizer(text), preprocessor=None, lowercase=False, token_pattern=None)
             try:
-                svd = TruncatedSVD(n_components=n_components, random_state=42)
-                X_tfidf = svd.fit_transform(X_tfidf)
-            except:
-                n_components = n_components // 2
-                svd = TruncatedSVD(n_components=n_components, random_state=42)  
-                X_tfidf = svd.fit_transform(X_tfidf)
+                X_counts = vectorizer.fit_transform(data)
+            except Exception as e:
+                print(e)
+                print(data)
+                return pd.DataFrame(columns=[
+                    f"{column_name}_1_index",
+                    f"{column_name}_2_index",
+                    f"{column_name}_similarity",
+                ])
+            # Transform the term-frequency matrix to a tf-idf representation
+            tfidf_transformer = TfidfTransformer(norm='l2', smooth_idf=True, use_idf=True)
+            X_tfidf = tfidf_transformer.fit_transform(X_counts)
+        elif similarity_method == 'numeric':
+            vectorizer = TfidfVectorizer(tokenizer=lambda x: re.findall(r'\d+', x), preprocessor=None, lowercase=False, token_pattern=None)
+            try:
+                X_tfidf = vectorizer.fit_transform(data)
+            except Exception as e:
+                print(e)
+                print(data)
+                return pd.DataFrame(columns=[
+                    f"{column_name}_1_index",
+                    f"{column_name}_2_index",
+                    f"{column_name}_similarity",
+                ])
+        
+        n_features = X_tfidf.shape[1]
+        n_components = 1000
+        n_components = min(n_features - 1, n_components)
+        
+        try:
+            svd = TruncatedSVD(n_components=n_components, random_state=42)
+            X_tfidf = svd.fit_transform(X_tfidf)
+        except:
+            n_components = n_components // 2
+            svd = TruncatedSVD(n_components=n_components, random_state=42)  
+            X_tfidf = svd.fit_transform(X_tfidf)
 
-            def compute_cosine_similarity_chunk(start_idx, end_idx, X_reduced, threshold):
-                chunk_matrix = cosine_similarity(X_reduced[start_idx:end_idx], X_reduced)
-                mask = chunk_matrix >= threshold
-                chunk_matrix = np.where(mask, chunk_matrix, 0)
-                return start_idx, end_idx, chunk_matrix
+        def compute_cosine_similarity_chunk(start_idx, end_idx, X_reduced, threshold):
+            chunk_matrix = cosine_similarity(X_reduced[start_idx:end_idx], X_reduced)
+            mask = chunk_matrix >= threshold
+            chunk_matrix = np.where(mask, chunk_matrix, 0)
+            return start_idx, end_idx, chunk_matrix
 
-            chunk_size = 500
-            n_samples = X_tfidf.shape[0]
-            cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
-            cos_sim_desc = f"Computing cosine similarity in chunks for {column_name}"
-            for start_idx in tqdm(range(0, n_samples, chunk_size), desc=cos_sim_desc, leave=False):
-                end_idx = min(start_idx + chunk_size, n_samples)
-                start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, X_tfidf, threshold)
-                cos_sim_sparse[start_idx:end_idx] = chunk_matrix
-            cos_sim_sparse = cos_sim_sparse.tocsr()
+        chunk_size = 500
+        n_samples = X_tfidf.shape[0]
+        cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
+        cos_sim_desc = f"Computing cosine similarity in chunks for {column_name}"
+        for start_idx in tqdm(range(0, n_samples, chunk_size), desc=cos_sim_desc, leave=False):
+            end_idx = min(start_idx + chunk_size, n_samples)
+            start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, X_tfidf, threshold)
+            cos_sim_sparse[start_idx:end_idx] = chunk_matrix
+        cos_sim_sparse = cos_sim_sparse.tocsr()
 
-            coo = coo_matrix(cos_sim_sparse)
-            rows, cols, values = coo.row, coo.col, coo.data
+        coo = coo_matrix(cos_sim_sparse)
+        rows, cols, values = coo.row, coo.col, coo.data
 
-            process_sim_desc = f"Processing similarities for {column_name}"
-            all_similarities = []
-            for i, j, value in tqdm(
-                zip(rows, cols, values),
-                total=len(values),
-                desc=process_sim_desc,
-                leave=False
-            ):
-                if i != j:
-                    all_similarities.append([original_indices[i], original_indices[j], value])  # Use original indices
+        process_sim_desc = f"Processing similarities for {column_name}"
+        all_similarities = []
+        for i, j, value in tqdm(
+            zip(rows, cols, values),
+            total=len(values),
+            desc=process_sim_desc,
+            leave=False
+        ):
+            if i != j:
+                all_similarities.append([original_indices[i], original_indices[j], value])  # Use original indices
         
         sim_df = pd.DataFrame(
             all_similarities,
@@ -207,6 +222,11 @@ class Entity_Fusion:
 
     def create_similarity_matrices(self):
         processed_dfs = []
+
+        # Define an empty DataFrame with all possible required columns
+        all_columns = ['idx1', 'idx2'] + [f"{col}_similarity" for col in self.column_thresholds.keys()]
+        empty_df = pd.DataFrame(columns=all_columns)
+
         for column, params in self.column_thresholds.items():
             threshold = params['threshold']
             similarity_method = params.get('similarity_method', 'tfidf')
@@ -214,7 +234,9 @@ class Entity_Fusion:
             if similarity_method == 'tfidf':
                 self.tfidf_scores = self._create_tfidf_matrix(data)
                 self.common_affixes = self.find_common_prefixes_and_postfixes(data)
-            grouped_processed_dfs = pd.DataFrame()
+            
+            # Start with an empty DataFrame with predefined columns
+            grouped_processed_dfs = empty_df.copy()
 
             if params.get('block', False):
                 grouped_data = [self.df]
@@ -230,35 +252,48 @@ class Entity_Fusion:
                             raise ValueError(f"Unsupported criterion: {criterion}")
                     grouped_data = [grp for _, grp in new_groups]
 
-                for group in tqdm(grouped_data):
+                for group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
                     if len(group) > 1:
                         grouped_processed_df = self._create_similarity_matrix(group, column, threshold, similarity_method)
                         if not grouped_processed_df.empty:
-                            grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df])
+                            # Rename columns to a consistent format
+                            grouped_processed_df.rename(columns={
+                                f"{column}_1_index": "idx1",
+                                f"{column}_2_index": "idx2",
+                                f"{column}_similarity": f"{column}_similarity"
+                            }, inplace=True)
+                            grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
             else:
                 grouped_processed_df = self._create_similarity_matrix(self.df, column, threshold, similarity_method)
                 if not grouped_processed_df.empty:
-                    grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df])
+                    # Rename columns to a consistent format
+                    grouped_processed_df.rename(columns={
+                        f"{column}_1_index": "idx1",
+                        f"{column}_2_index": "idx2",
+                        f"{column}_similarity": f"{column}_similarity"
+                    }, inplace=True)
+                    grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
 
             processed_dfs.append(grouped_processed_dfs)
-        # pdb.set_trace()
-        def merge_dataframes(left_df, right_df, left_col, right_col):
+
+        # Incremental merge with debugging
+        def merge_dataframes(left_df, right_df):
             return pd.merge(
                 left_df,
                 right_df,
-                left_on=[f"{left_col}_1_index", f"{left_col}_2_index"],
-                right_on=[f"{right_col}_1_index", f"{right_col}_2_index"],
-                how="outer",
-                suffixes=(f"_{left_col}", f"_{right_col}")
+                on=["idx1", "idx2"],
+                how="outer"
             )
-            
-        column_names = list(self.column_thresholds.keys())
-        df_sim = reduce(lambda left, right: merge_dataframes(left, right, column_names[0], column_names[1]), processed_dfs)
-        for i in range(1, 3):
-            columns_to_check = [x for x in df_sim.columns if f"{i}_index" in x]
-            df_sim[f"idx{i}"] = df_sim[columns_to_check].bfill(axis=1).iloc[:, 0]
-            df_sim.drop(columns=columns_to_check, inplace=True)
+
+        if not processed_dfs:
+            raise ValueError("No processed DataFrames to merge.")
         
+        # Initialize merged DataFrame
+        df_sim = processed_dfs[0]
+        for i in range(1, len(processed_dfs)):
+            df_sim = merge_dataframes(df_sim, processed_dfs[i])
+            print(f"Merged DataFrame {i}")
+
         df_sim = df_sim.fillna(0)
         self.df_sim = df_sim
         return df_sim
