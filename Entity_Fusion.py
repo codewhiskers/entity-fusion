@@ -224,9 +224,8 @@ class Entity_Fusion:
         processed_dfs = []
 
         # Define an empty DataFrame with all possible required columns
-        all_columns = ['idx1', 'idx2'] + [f"{col}_similarity" for col in self.column_thresholds.keys()]
-        empty_df = pd.DataFrame(columns=all_columns)
-
+        # all_columns = ['idx1', 'idx2'] + [f"{col}_similarity" for col in self.column_thresholds.keys()]
+        empty_df = pd.DataFrame()#columns=all_columns)
         for column, params in self.column_thresholds.items():
             threshold = params['threshold']
             similarity_method = params.get('similarity_method', 'tfidf')
@@ -237,7 +236,6 @@ class Entity_Fusion:
             
             # Start with an empty DataFrame with predefined columns
             grouped_processed_dfs = empty_df.copy()
-
             if params.get('block', False):
                 grouped_data = [self.df]
                 for criterion in params['criteria']:
@@ -262,7 +260,14 @@ class Entity_Fusion:
                                 f"{column}_2_index": "idx2",
                                 f"{column}_similarity": f"{column}_similarity"
                             }, inplace=True)
-                            grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
+                            grouped_processed_df = grouped_processed_df[['idx1', 'idx2', f"{column}_similarity"]]
+                        else:
+                            grouped_processed_df = pd.DataFrame(columns=[
+                                "idx1",
+                                "idx2",
+                                f"{column}_similarity",
+                            ])
+                        grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
             else:
                 grouped_processed_df = self._create_similarity_matrix(self.df, column, threshold, similarity_method)
                 if not grouped_processed_df.empty:
@@ -272,10 +277,19 @@ class Entity_Fusion:
                         f"{column}_2_index": "idx2",
                         f"{column}_similarity": f"{column}_similarity"
                     }, inplace=True)
-                    grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
+                    grouped_processed_df = grouped_processed_df[['idx1', 'idx2', f"{column}_similarity"]]
+                    
+                else:
+                    grouped_processed_df = pd.DataFrame(columns=[
+                        "idx1",
+                        "idx2",
+                        f"{column}_similarity",
+                    ])
+                    
+                grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
 
             processed_dfs.append(grouped_processed_dfs)
-
+        pdb.set_trace()
         # Incremental merge with debugging
         def merge_dataframes(left_df, right_df):
             return pd.merge(
@@ -293,7 +307,7 @@ class Entity_Fusion:
         for i in range(1, len(processed_dfs)):
             df_sim = merge_dataframes(df_sim, processed_dfs[i])
             print(f"Merged DataFrame {i}")
-
+        pdb.set_trace()
         df_sim = df_sim.fillna(0)
         self.df_sim = df_sim
         return df_sim
