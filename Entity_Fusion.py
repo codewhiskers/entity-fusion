@@ -9,8 +9,9 @@ from sklearn.decomposition import TruncatedSVD
 import pdb
 from scipy.sparse import lil_matrix, coo_matrix
 import networkx as nx
-from functools import reduce
 import plotly.graph_objects as go
+# import plotly.io as pio
+from IPython.display import display
 from collections import Counter
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 import re
@@ -39,8 +40,6 @@ class Entity_Fusion:
         threshold = 5
         all_words = [word for text in data for word in text.split()]
         word_counts = Counter(all_words)
-        # common_prefixes = [word for word, count in word_counts.items() if count >= threshold and len(word) >= min_length]
-        # pdb.set_trace()
         common_affixes = [word for word, count in word_counts.items() if count >= threshold and len(word) >= min_length]
         return common_affixes#common_prefixes, common_postfixes
 
@@ -88,9 +87,6 @@ class Entity_Fusion:
         return idf_scores
 
     def custom_tokenizer(self, text):
-        # pdb.set_trace()
-        # words = text.split()
-        # pdb.set_trace()
         words = self.split_string_with_spaces(text) 
         total_words = len(words)
         
@@ -238,7 +234,7 @@ class Entity_Fusion:
 
         # Define an empty DataFrame with all possible required columns
         # all_columns = ['idx1', 'idx2'] + [f"{col}_similarity" for col in self.column_thresholds.keys()]
-        empty_df = pd.DataFrame()#columns=all_columns)
+        # empty_df = pd.DataFrame()#columns=all_columns)
         for column, params in self.column_thresholds.items():
             threshold = params['threshold']
             similarity_method = params.get('similarity_method', 'tfidf')
@@ -248,7 +244,7 @@ class Entity_Fusion:
                 self.common_affixes = self.find_common_prefixes_and_postfixes(data)
             
             # Start with an empty DataFrame with predefined columns
-            grouped_processed_dfs = empty_df.copy()
+            grouped_processed_dfs = pd.DataFrame()
             if params.get('block', False):
                 grouped_data = [self.df]
                 for criterion in params['criteria']:
@@ -274,13 +270,6 @@ class Entity_Fusion:
                                 f"{column}_similarity": f"{column}_similarity"
                             }, inplace=True)
                             grouped_processed_df = grouped_processed_df[['idx1', 'idx2', f"{column}_similarity"]]
-                        else:
-                            grouped_processed_df = pd.DataFrame(columns=[
-                                "idx1",
-                                "idx2",
-                                f"{column}_similarity",
-                            ])
-                        if not grouped_processed_dfs.empty:
                             grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
             else:
                 grouped_processed_df = self._create_similarity_matrix(self.df, column, threshold, similarity_method)
@@ -292,18 +281,16 @@ class Entity_Fusion:
                         f"{column}_similarity": f"{column}_similarity"
                     }, inplace=True)
                     grouped_processed_df = grouped_processed_df[['idx1', 'idx2', f"{column}_similarity"]]
-                    
-                else:
-                    grouped_processed_df = pd.DataFrame(columns=[
-                        "idx1",
-                        "idx2",
-                        f"{column}_similarity",
-                    ])
-                
-                grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
-
+                    grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
+            
+            if grouped_processed_dfs.empty:
+                grouped_processed_dfs = pd.DataFrame(columns=[
+                    "idx1",
+                    "idx2",
+                    f"{column}_similarity",
+                ])
             processed_dfs.append(grouped_processed_dfs)
-        pdb.set_trace()
+        
         # Incremental merge with debugging
         def merge_dataframes(left_df, right_df):
             return pd.merge(
@@ -312,7 +299,7 @@ class Entity_Fusion:
                 on=["idx1", "idx2"],
                 how="outer"
             )
-
+        
         if not processed_dfs:
             raise ValueError("No processed DataFrames to merge.")
         
@@ -321,7 +308,6 @@ class Entity_Fusion:
         for i in range(1, len(processed_dfs)):
             df_sim = merge_dataframes(df_sim, processed_dfs[i])
             print(f"Merged DataFrame {i}")
-        pdb.set_trace()
         df_sim = df_sim.fillna(0)
         self.df_sim = df_sim
         return df_sim
@@ -418,7 +404,6 @@ class Entity_Fusion:
         self.create_similarity_matrices()
         self._construct_similarity_graph()
         self._find_clusters()
-        # pdb.set_trace()
         self.df["cluster_label"] = self.df.index.map(self.clusters)
         if self.post_clustered_df is not None:
             self.update_clusters_with_post_clustered(self.post_clustered_df)
@@ -453,9 +438,22 @@ class Entity_Fusion:
     
     # Function to visualize a specific cluster interactively
     # def visualize_cluster(graph, clusters, cluster_id):
-    def visualize_cluster(self, cluster_id):
+    def visualize_cluster(self, cluster_id, hover_columns=None):
+        if self.graph is None or self.clusters is None:
+            print("Graph or clusters not initialized.")
+            return
+        
+        # Create a NetworkX graph from the clusters and edges
+        G = nx.Graph()
+        
+        # Add edges to the graph
+        for node, neighbors in self.graph.items():
+            for neighbor in neighbors:
+                G.add_edge(node, neighbor)
+
+        # Extract nodes in the cluster
         nodes_in_cluster = [node for node, cluster in self.clusters.items() if cluster == cluster_id]
-        subgraph = self.graph.subgraph(nodes_in_cluster)
+        subgraph = G.subgraph(nodes_in_cluster)
         
         pos = nx.spring_layout(subgraph)
         
@@ -480,16 +478,26 @@ class Entity_Fusion:
         
         node_x = []
         node_y = []
+        hover_texts = []
         for node in subgraph.nodes():
             x, y = pos[node]
             node_x.append(x)
             node_y.append(y)
+            
+            # Generate custom hover text
+            hover_text = f"Node: {node}"
+            if hover_columns:
+                for col in hover_columns:
+                    if col in self.df.columns:
+                        hover_text += f"<br>{col}: {self.df.loc[node, col]}"
+            hover_texts.append(hover_text)
         
         node_trace = go.Scatter(
             x=node_x, y=node_y,
             mode='markers+text',
             text=[str(node) for node in subgraph.nodes()],
             textposition="bottom center",
+            hovertext=hover_texts,
             hoverinfo='text',
             marker=dict(
                 showscale=True,
@@ -510,13 +518,13 @@ class Entity_Fusion:
                             titlefont_size=16,
                             showlegend=False,
                             hovermode='closest',
-                            margin=dict(b=20,l=5,r=5,t=40),
-                            annotations=[ dict(
+                            margin=dict(b=20, l=5, r=5, t=40),
+                            annotations=[dict(
                                 text="Interactive graph where nodes can be moved",
                                 showarrow=False,
                                 xref="paper", yref="paper",
-                                x=0.005, y=-0.002 ) ],
+                                x=0.005, y=-0.002)],
                             xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
                             yaxis=dict(showgrid=False, zeroline=False, showticklabels=False))
                         )
-        fig.show()
+        display(fig)
