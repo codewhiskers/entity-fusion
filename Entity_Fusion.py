@@ -12,23 +12,25 @@ import networkx as nx
 import plotly.graph_objects as go
 # import plotly.io as pio
 from IPython.display import display
-from collections import Counter
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 import re
-from collections import deque
+from collections import deque, Counter, defaultdict
 
 
 class Entity_Fusion:
     
-    def __init__(self, df, column_thresholds, conditional='OR', post_clustered_df=None):
+    def __init__(self, df, column_thresholds, id_column=None, conditional='OR', pre_clustered_df=None):
         self.df = df.reset_index(drop=True)
         self.column_thresholds = column_thresholds
+        self.id_column = id_column if id_column else 'id'
         self.conditional = conditional
-        self.post_clustered_df = post_clustered_df
+        self.pre_clustered_df = pre_clustered_df
         self.df_sim = None
         self.graph = None
         self.clusters = None
         self.stopwords = set(ENGLISH_STOP_WORDS)
+        if self.id_column not in self.df.columns:
+            self.df[self.id_column] = range(1, len(self.df) + 1)
 
     def levenshtein_similarity(self, a, b):
         max_len = max(len(a), len(b))
@@ -228,13 +230,9 @@ class Entity_Fusion:
         )
         return sim_df
     
-
     def create_similarity_matrices(self):
         processed_dfs = []
 
-        # Define an empty DataFrame with all possible required columns
-        # all_columns = ['idx1', 'idx2'] + [f"{col}_similarity" for col in self.column_thresholds.keys()]
-        # empty_df = pd.DataFrame()#columns=all_columns)
         for column, params in self.column_thresholds.items():
             threshold = params['threshold']
             similarity_method = params.get('similarity_method', 'tfidf')
@@ -243,8 +241,8 @@ class Entity_Fusion:
                 self.tfidf_scores = self._create_tfidf_matrix(data)
                 self.common_affixes = self.find_common_prefixes_and_postfixes(data)
             
-            # Start with an empty DataFrame with predefined columns
             grouped_processed_dfs = pd.DataFrame()
+
             if params.get('block', False):
                 grouped_data = [self.df]
                 for criterion in params['criteria']:
@@ -263,7 +261,6 @@ class Entity_Fusion:
                     if len(group) > 1:
                         grouped_processed_df = self._create_similarity_matrix(group, column, threshold, similarity_method, progress_bar=False)
                         if not grouped_processed_df.empty:
-                            # Rename columns to a consistent format
                             grouped_processed_df.rename(columns={
                                 f"{column}_1_index": "idx1",
                                 f"{column}_2_index": "idx2",
@@ -274,7 +271,6 @@ class Entity_Fusion:
             else:
                 grouped_processed_df = self._create_similarity_matrix(self.df, column, threshold, similarity_method)
                 if not grouped_processed_df.empty:
-                    # Rename columns to a consistent format
                     grouped_processed_df.rename(columns={
                         f"{column}_1_index": "idx1",
                         f"{column}_2_index": "idx2",
@@ -293,6 +289,7 @@ class Entity_Fusion:
         
         # Incremental merge with debugging
         def merge_dataframes(left_df, right_df):
+            print(f"Merging dataframes: {left_df.shape} with {right_df.shape}")
             return pd.merge(
                 left_df,
                 right_df,
@@ -307,7 +304,7 @@ class Entity_Fusion:
         df_sim = processed_dfs[0]
         for i in range(1, len(processed_dfs)):
             df_sim = merge_dataframes(df_sim, processed_dfs[i])
-            print(f"Merged DataFrame {i}")
+            print(f"Merged DataFrame {i}: {df_sim.shape}")
         df_sim = df_sim.fillna(0)
         self.df_sim = df_sim
         return df_sim
@@ -315,10 +312,12 @@ class Entity_Fusion:
 
     def _construct_similarity_graph(self):
         print('Computing similarity graph...')
+        self.graph = defaultdict(set)
 
         # Create boolean masks for the conditions
         masks = []
         for col, params in self.column_thresholds.items():
+            print(f"Processing column: {col}")
             masks.append(self.df_sim[f"{col}_similarity"] >= params['threshold'])
         
         if self.conditional == 'AND':
@@ -326,29 +325,60 @@ class Entity_Fusion:
         else:  # self.conditional == 'OR'
             final_mask = np.logical_or.reduce(masks)
 
+        print(f"Final mask: {final_mask}")
+
         # Use the final mask to filter the DataFrame
         filtered_df = self.df_sim[final_mask]
+        print(f"Filtered DataFrame: {filtered_df.shape}")
+
+        # Convert pre-clustered DataFrame to sets for quick lookup
+        if self.pre_clustered_df is not None:
+            exclude_set = set(zip(self.pre_clustered_df[self.pre_clustered_df['match'] == False]['id1'],
+                                self.pre_clustered_df[self.pre_clustered_df['match'] == False]['id2']))
+            reverse_exclude_set = set((y, x) for x, y in exclude_set)  # Create reverse pairs
+            exclude_set.update(reverse_exclude_set)
+            print(f"Exclude set: {exclude_set}")
+            
+            include_set = set(zip(self.pre_clustered_df[self.pre_clustered_df['match'] == True]['id1'],
+                                self.pre_clustered_df[self.pre_clustered_df['match'] == True]['id2']))
+            reverse_include_set = set((y, x) for x, y in include_set)  # Create reverse pairs
+            include_set.update(reverse_include_set)
+            print(f"Include set: {include_set}")
+        else:
+            exclude_set = set()
+            include_set = set()
 
         # Extract edges using vectorized operations
         idx1 = filtered_df["idx1"].astype(int)
         idx2 = filtered_df["idx2"].astype(int)
         edges = list(zip(idx1, idx2))
 
-        # Build the graph using a dictionary of sets for efficiency
-        graph_dict = {}
-        for idx1, idx2 in tqdm(edges, desc="Adding edges to the graph"):
-            if idx1 not in graph_dict:
-                graph_dict[idx1] = set()
-            if idx2 not in graph_dict:
-                graph_dict[idx2] = set()
-            graph_dict[idx1].add(idx2)
-            graph_dict[idx2].add(idx1)
+        # # Debug print to check the edges
+        # print(f"Edges: {edges}")
 
-        self.graph = graph_dict
+        # Add edges to the graph with a progress bar
+        for edge in tqdm(edges, desc="Adding edges to the graph"):
+            if edge[0] is None or edge[1] is None:
+                print(f"Invalid edge found: {edge}")
+                continue
+
+            id1 = self.df.loc[edge[0], self.id_column]
+            id2 = self.df.loc[edge[1], self.id_column]
+            if (id1, id2) not in exclude_set:
+                self.graph[edge[0]].add(edge[1])
+                self.graph[edge[1]].add(edge[0])
+        
+        # Add edges from the include set
+        for id1, id2 in include_set:
+            node1 = self.df[self.df[self.id_column] == id1].index[0]
+            node2 = self.df[self.df[self.id_column] == id2].index[0]
+            self.graph[node1].add(node2)
+            self.graph[node2].add(node1)
+
         print('Similarity graph constructed.')
-        return graph_dict
-    
-    def _find_clusters(self):
+        return self.graph
+
+    def _find_clusters_from_graph(self, graph):
         def bfs(graph, start_node, visited):
             cluster = set()
             queue = deque([start_node])
@@ -360,14 +390,13 @@ class Entity_Fusion:
                     queue.extend(graph[node] - visited)
             return cluster
 
-        print('Finding clusters...')
         clusters = []
         visited = set()
-        nodes = list(self.graph.keys())
+        nodes = list(graph.keys())
 
         for node in tqdm(nodes, desc="Processing nodes"):
             if node not in visited:
-                cluster = bfs(self.graph, node, visited)
+                cluster = bfs(graph, node, visited)
                 clusters.append(cluster)
 
         cluster_map = {}
@@ -375,8 +404,6 @@ class Entity_Fusion:
             for node in cluster:
                 cluster_map[node] = cluster_id
 
-        self.clusters = cluster_map
-        print('Clusters found.')
         return cluster_map
     
     def update_clusters_with_post_clustered(self, df_post_clustered):
@@ -403,11 +430,8 @@ class Entity_Fusion:
     def cluster_data(self):
         self.create_similarity_matrices()
         self._construct_similarity_graph()
-        self._find_clusters()
+        self.clusters = self._find_clusters_from_graph(self.graph)
         self.df["cluster_label"] = self.df.index.map(self.clusters)
-        if self.post_clustered_df is not None:
-            self.update_clusters_with_post_clustered(self.post_clustered_df)
-    
         return self.df
     
     def return_cluster_data_logic_dataframe(self):
@@ -437,7 +461,6 @@ class Entity_Fusion:
         return self.df_sim
     
     # Function to visualize a specific cluster interactively
-    # def visualize_cluster(graph, clusters, cluster_id):
     def visualize_cluster(self, cluster_id, hover_columns=None):
         if self.graph is None or self.clusters is None:
             print("Graph or clusters not initialized.")
