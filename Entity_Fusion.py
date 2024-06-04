@@ -138,6 +138,8 @@ class Entity_Fusion:
                 f"{column_name}_2_index",
                 f"{column_name}_similarity",
             ])
+        if len(data) > 20_000: # Turn progress bar on since data is large
+            progress_bar=True
         if similarity_method == 'tfidf':
             vectorizer = CountVectorizer(tokenizer=lambda text: self.custom_tokenizer(text), preprocessor=None, lowercase=False, token_pattern=None)
             try:
@@ -169,14 +171,14 @@ class Entity_Fusion:
         n_features = X_tfidf.shape[1]
         n_components = 1000
         n_components = min(n_features - 1, n_components)
-        
-        try:
-            svd = TruncatedSVD(n_components=n_components, random_state=42)
-            X_tfidf = svd.fit_transform(X_tfidf)
-        except:
-            n_components = n_components // 2
-            svd = TruncatedSVD(n_components=n_components, random_state=42)  
-            X_tfidf = svd.fit_transform(X_tfidf)
+        if n_components > 1:
+            try:
+                svd = TruncatedSVD(n_components=n_components, random_state=42)
+                X_tfidf = svd.fit_transform(X_tfidf)
+            except:
+                n_components = n_components // 2
+                svd = TruncatedSVD(n_components=n_components, random_state=42)  
+                X_tfidf = svd.fit_transform(X_tfidf)
 
         def compute_cosine_similarity_chunk(start_idx, end_idx, X_reduced, threshold):
             chunk_matrix = cosine_similarity(X_reduced[start_idx:end_idx], X_reduced)
@@ -241,7 +243,7 @@ class Entity_Fusion:
                 self.tfidf_scores = self._create_tfidf_matrix(data)
                 self.common_affixes = self.find_common_prefixes_and_postfixes(data)
             
-            grouped_processed_dfs = pd.DataFrame()
+            grouped_processed_dfs = pd.DataFrame(columns=['idx1', 'idx2', f"{column}_similarity"])
 
             if params.get('block', False):
                 grouped_data = [self.df]
@@ -251,8 +253,12 @@ class Entity_Fusion:
                         if criterion == 'first_letter':
                             new_groups.extend(list(group.groupby(group[column].str[0])))
                         elif criterion == 'blocking_column':
-                            block_column = params.get('blocking_column')
-                            new_groups.extend(list(group.groupby(group[block_column])))
+                            blocking_columns = params.get('blocking_column')
+                            if isinstance(blocking_columns, list):
+                                for blocking_column in blocking_columns:
+                                    new_groups.extend(list(group.groupby(group[blocking_column])))
+                            else:
+                                new_groups.extend(list(group.groupby(group[blocking_columns])))
                         else:
                             raise ValueError(f"Unsupported criterion: {criterion}")
                     grouped_data = [grp for _, grp in new_groups]
@@ -278,7 +284,7 @@ class Entity_Fusion:
                     }, inplace=True)
                     grouped_processed_df = grouped_processed_df[['idx1', 'idx2', f"{column}_similarity"]]
                     grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
-            
+
             if grouped_processed_dfs.empty:
                 grouped_processed_dfs = pd.DataFrame(columns=[
                     "idx1",
@@ -353,8 +359,6 @@ class Entity_Fusion:
         idx2 = filtered_df["idx2"].astype(int)
         edges = list(zip(idx1, idx2))
 
-        # # Debug print to check the edges
-        # print(f"Edges: {edges}")
 
         # Add edges to the graph with a progress bar
         for edge in tqdm(edges, desc="Adding edges to the graph"):
@@ -370,8 +374,8 @@ class Entity_Fusion:
         
         # Add edges from the include set
         for id1, id2 in include_set:
-            node1 = self.df[self.df[self.id_column] == id1].index[0]
-            node2 = self.df[self.df[self.id_column] == id2].index[0]
+            node1 = self.df[self.df[self.id_column].astype(str) == str(id1)].index[0]
+            node2 = self.df[self.df[self.id_column].astype(str) == str(id2)].index[0]
             self.graph[node1].add(node2)
             self.graph[node2].add(node1)
 
