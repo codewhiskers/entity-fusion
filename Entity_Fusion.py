@@ -235,14 +235,18 @@ class Entity_Fusion:
         )
         return sim_df
     
-    def create_similarity_matrices(self):
+    def create_similarity_matrices(self, sample_fraction=0.1, max_sample_size=10000):
         processed_dfs = []
         data = self.df[self.column_thresholds.keys()].astype(str).values.flatten()  
         self.tfidf_scores = self._create_tfidf_matrix(data)
         self.common_affixes = self.find_common_prefixes_and_postfixes(data)
-        # Fit vectorizer on the entire dataset
+        # Sample data to fit the global vectorizer
+        sample_size = min(int(len(self.df) * sample_fraction), max_sample_size)
+        sample_df = self.df.sample(n=sample_size, random_state=42)
+        # pdb.set_trace()
+        # Fit vectorizer on the sample dataset
         global_vectorizer = CountVectorizer(tokenizer=lambda text: self.custom_tokenizer(text), preprocessor=None, lowercase=False, token_pattern=None)
-        global_vectorizer.fit(self.df[self.column_thresholds.keys()].astype(str).values.flatten())
+        global_vectorizer.fit(sample_df[self.column_thresholds.keys()].astype(str).values.flatten())
 
         for column, params in self.column_thresholds.items():
             threshold = params['threshold']
