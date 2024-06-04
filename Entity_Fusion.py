@@ -65,68 +65,41 @@ class Entity_Fusion:
                 result.append(' ' + word + ' ')
         return result
 
-    # def _create_tfidf_matrix(self, data):
-    #     vectorizer = TfidfVectorizer(
-    #         tokenizer=lambda text: self._split_string_with_spaces(text),
-    #         preprocessor=None,
-    #         lowercase=False,
-    #         sublinear_tf=True,
-    #         norm=None,
-    #         token_pattern=None,
-    #     )
-    #     vectorizer.fit(data)
-    #     # Get feature names
-    #     feature_names = vectorizer.get_feature_names_out()
-    #     # Get IDF values
-    #     idf_values = vectorizer.idf_
-    #     idf_scores = dict(zip(feature_names, idf_values))
-    #     # scaling_factor = 5  # Choose a factor to scale up the scores
-    #     idf_scores = {term: score for term, score in idf_scores.items()}
-    #     return idf_scores
-
-    def _custom_tokenizer(self, text):
-        words = self._split_string_with_spaces(text) 
-        total_words = len(words)
+    # def _custom_tokenizer(self, text):
+    #     words = self._split_string_with_spaces(text) 
+    #     total_words = len(words)
         
-        # # Use a more gradual dropoff for shorter strings
-        # base = np.log(total_words + 1)
+    #     # # Use a more gradual dropoff for shorter strings
+    #     # base = np.log(total_words + 1)
         
-        # # Calculate initial weights using logarithm and base
-        # initial_weights = [1 / (np.log(i + 1) + base) ** 2 for i in range(1, total_words + 1)]
+    #     # # Calculate initial weights using logarithm and base
+    #     # initial_weights = [1 / (np.log(i + 1) + base) ** 2 for i in range(1, total_words + 1)]
         
-        # # Normalize weights so that the first weight is 1
-        # first_weight = initial_weights[0]
-        # word_weights = [weight / first_weight for weight in initial_weights]
-        word_weights = [1 for i in range(1, total_words + 1)]
+    #     # # Normalize weights so that the first weight is 1
+    #     # first_weight = initial_weights[0]
+    #     # word_weights = [weight / first_weight for weight in initial_weights]
+    #     word_weights = [1 for i in range(1, total_words + 1)]
 
-        weighted_tokens = []
-        for word, weight in zip(words, word_weights):
-            # Remove stopwords... 
-            if word.lower().strip() in self.stopwords:
-                continue
-            # if self.tfidf_scores is not None:
-            #     tfidf_weight = self.tfidf_scores.get(word, 1)
-            #     weight *= tfidf_weight
-
-            # Reduce weight for common postfixes
-            if word.strip() in self.common_affixes:
-                if word == words[-1]:
-                    weight *= 0.5
-                if word == words[0]:
-                    weight *= 0.5
+    #     weighted_tokens = []
+    #     for word, weight in zip(words, word_weights):
+    #         # Remove stopwords... 
+    #         # if word.lower().strip() in self.stopwords:
+    #         #     continue
+    #         # Reduce weight for common postfixes
+    #         if word.strip() in self.common_affixes:
+    #             if word == words[-1]:
+    #                 weight *= 0.5
+    #             if word == words[0]:
+    #                 weight *= 0.75
                     
-            # Generate 2-word and 3-word tokens including spaces
-            if len(word) > 1:  # Ensure the word length is valid for bi-gram generation
-                tokens = [word[i:i+2] for i in range(len(word) - 1)]
-                for token in tokens:
-                    weighted_tokens.extend([token] * int(weight * 5))# * 100))  # Adjust weight scaling as needed
-
-        return weighted_tokens
+    #         # Generate 2-word and 3-word tokens including spaces
+    #         if len(word) > 2:  # Ensure the word length is valid for bi-gram generation
+    #             tokens = [word[i:i+3] for i in range(len(word) - 2)]
+    #             for token in tokens:
+    #                 weighted_tokens.extend([token] * int(weight * 10))# * 100))  # Adjust weight scaling as needed
+    #     return weighted_tokens
 
     def _create_similarity_matrix(self, group_tfidf, group_indices, column_name, threshold, progress_bar=True):
-        # group[column_name] = group[column_name].astype(str)  # REMOVE NONETYPES OR SOMETHING
-        # data = group[column_name].tolist()
-        # original_indices = group.index.tolist()  # Keep track of the original indices
         # Define Empty DataFrame which will be returned in case of empty data... etc
         empty_dataframe = pd.DataFrame(columns=[
                 f"{column_name}_1_index",
@@ -134,31 +107,20 @@ class Entity_Fusion:
                 f"{column_name}_similarity",
             ])
 
-        # if len(group_tfidf) <= 1:
-        #     # Skip processing for groups with only one row
-        #     return empty_dataframe
-
         if group_tfidf.shape[0] > 5_000:  # Turn progress bar on since data is large
             progress_bar = True
 
-        # if similarity_method == 'tfidf':
-        # try:
-        #     X_tfidf = vectorizer.transform(data)
-        # except Exception as e:
-        #     print(e)
-        #     print(data)
-        #     return empty_dataframe
-        n_features = group_tfidf.shape[1]
-        n_components = 1500
-        n_components = min(n_features - 1, n_components)
-        if n_components > 1:
-            while n_components > 1:
-                try:
-                    svd = TruncatedSVD(n_components=n_components, random_state=42)
-                    group_tfidf = svd.fit_transform(group_tfidf)
-                    break
-                except:
-                    n_components = n_components // 2
+        # n_features = group_tfidf.shape[1]
+        # n_components = 1500
+        # n_components = min(n_features - 1, n_components)
+        # if n_components > 1:
+        #     while n_components > 1:
+        #         try:
+        #             svd = TruncatedSVD(n_components=n_components, random_state=42)
+        #             group_tfidf = svd.fit_transform(group_tfidf)
+        #             break
+        #         except:
+        #             n_components = n_components // 2
 
         def compute_cosine_similarity_chunk(start_idx, end_idx, X_reduced, threshold):
             chunk_matrix = cosine_similarity(X_reduced[start_idx:end_idx], X_reduced)
@@ -166,7 +128,7 @@ class Entity_Fusion:
             chunk_matrix = np.where(mask, chunk_matrix, 0)
             return start_idx, end_idx, chunk_matrix
 
-        chunk_size = 1000
+        chunk_size = 500
         n_samples = group_tfidf.shape[0]
         cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
         cos_sim_desc = f"Computing cosine similarity in chunks for {column_name}"
@@ -180,9 +142,8 @@ class Entity_Fusion:
                 end_idx = min(start_idx + chunk_size, n_samples)
                 start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, group_tfidf, threshold)
                 cos_sim_sparse[start_idx:end_idx] = chunk_matrix
-
+    
         cos_sim_sparse = cos_sim_sparse.tocsr()
-        # pdb.set_trace()
         coo = coo_matrix(cos_sim_sparse)
         rows, cols, values = coo.row, coo.col, coo.data
         if progress_bar:
@@ -213,34 +174,18 @@ class Entity_Fusion:
         return sim_df
     
     def create_similarity_matrices(self, sample_fraction=0.1, max_sample_size=10000):
-        
-        def create_vectorizer_from_sample(column, sample_fraction, max_sample_size, similarity_method='tfidf'):
-            # Create vectorizer
-            if similarity_method == 'numeric':
-                vectorizer = TfidfVectorizer(tokenizer=lambda x: re.findall(r'\d+', x), preprocessor=None, lowercase=False, token_pattern=None)
-            elif similarity_method == 'tfidf':
-                vectorizer = TfidfVectorizer(tokenizer=lambda text: self._custom_tokenizer(text), norm='l2', smooth_idf=True, use_idf=True, token_pattern=None)
-                # vectorizer = CountVectorizer(tokenizer=lambda text: self._custom_tokenizer(text), preprocessor=None, lowercase=False, token_pattern=None)
-                
-            # Create sample
-            # sample_size = min(int(len(self.df) * sample_fraction), max_sample_size)
-            # sample_data = self.df[self.df[column].notnull()][column].sample(sample_size, random_state=42)
-            
-            sample_data = self.df[self.df[column].notnull()][column]
-            X_tfidf = vectorizer.fit_transform(sample_data)
-            return X_tfidf
-        
-        
+
         processed_dfs = []
         for column, params in self.column_thresholds.items():
             
             similarity_method = params.get('similarity_method', 'tfidf')
-            data = self.df[column].astype(str).tolist()
-            if similarity_method == 'tfidf':
-                # self.tfidf_scores = self._create_tfidf_matrix(data)
-                self.common_affixes = self._find_common_prefixes_and_postfixes(data)
-                
-            X_tfidf = create_vectorizer_from_sample(column, sample_fraction, max_sample_size, similarity_method)
+            data = self.df[self.df[column].notnull()][column].tolist()
+            if similarity_method == 'numeric':
+                vectorizer = TfidfVectorizer(tokenizer=lambda x: re.findall(r'\d+', x), preprocessor=None, lowercase=False, token_pattern=None)
+            elif similarity_method == 'tfidf':
+                vectorizer = TfidfVectorizer(preprocessor=None, lowercase=False, ngram_range=(2, 3), norm='l2', smooth_idf=True, use_idf=True, stop_words='english')
+            X_tfidf = vectorizer.fit_transform(data)
+            
             grouped_processed_dfs = pd.DataFrame(columns=['idx1', 'idx2', f"{column}_similarity"])
             
             # Create groups if blocking is enabled
