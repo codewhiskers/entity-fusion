@@ -28,6 +28,7 @@ class Entity_Fusion:
         self.df_sim = None
         self.graph = None
         self.clusters = None
+        # self.tfidf_scores = None
         self.stopwords = set(ENGLISH_STOP_WORDS)
         if self.id_column not in self.df.columns:
             self.df[self.id_column] = range(1, len(self.df) + 1)
@@ -127,10 +128,11 @@ class Entity_Fusion:
         
         return weighted_tokens
 
-    def _create_similarity_matrix(self, group, column_name, threshold, similarity_method, progress_bar=True):
-        group[column_name] = group[column_name].astype(str) #REMOVE NONETYPES OR SOMETHING
+    def _create_similarity_matrix(self, group, column_name, threshold, similarity_method, global_vectorizer, progress_bar=True):
+        group[column_name] = group[column_name].astype(str)  # REMOVE NONETYPES OR SOMETHING
         data = group[column_name].tolist()
         original_indices = group.index.tolist()  # Keep track of the original indices
+
         if len(data) <= 1:
             # Skip processing for groups with only one row
             return pd.DataFrame(columns=[
@@ -138,12 +140,13 @@ class Entity_Fusion:
                 f"{column_name}_2_index",
                 f"{column_name}_similarity",
             ])
-        if len(data) > 20_000: # Turn progress bar on since data is large
-            progress_bar=True
+
+        if len(data) > 20_000:  # Turn progress bar on since data is large
+            progress_bar = True
+
         if similarity_method == 'tfidf':
-            vectorizer = CountVectorizer(tokenizer=lambda text: self.custom_tokenizer(text), preprocessor=None, lowercase=False, token_pattern=None)
             try:
-                X_counts = vectorizer.fit_transform(data)
+                X_counts = global_vectorizer.transform(data)
             except Exception as e:
                 print(e)
                 print(data)
@@ -167,18 +170,18 @@ class Entity_Fusion:
                     f"{column_name}_2_index",
                     f"{column_name}_similarity",
                 ])
-        
+
         n_features = X_tfidf.shape[1]
         n_components = 1000
         n_components = min(n_features - 1, n_components)
         if n_components > 1:
-            try:
-                svd = TruncatedSVD(n_components=n_components, random_state=42)
-                X_tfidf = svd.fit_transform(X_tfidf)
-            except:
-                n_components = n_components // 2
-                svd = TruncatedSVD(n_components=n_components, random_state=42)  
-                X_tfidf = svd.fit_transform(X_tfidf)
+            while n_components > 1:
+                try:
+                    svd = TruncatedSVD(n_components=n_components, random_state=42)
+                    X_tfidf = svd.fit_transform(X_tfidf)
+                    break
+                except:
+                    n_components = n_components // 2
 
         def compute_cosine_similarity_chunk(start_idx, end_idx, X_reduced, threshold):
             chunk_matrix = cosine_similarity(X_reduced[start_idx:end_idx], X_reduced)
@@ -200,7 +203,7 @@ class Entity_Fusion:
                 end_idx = min(start_idx + chunk_size, n_samples)
                 start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, X_tfidf, threshold)
                 cos_sim_sparse[start_idx:end_idx] = chunk_matrix
-                
+
         cos_sim_sparse = cos_sim_sparse.tocsr()
 
         coo = coo_matrix(cos_sim_sparse)
@@ -234,14 +237,20 @@ class Entity_Fusion:
     
     def create_similarity_matrices(self):
         processed_dfs = []
+        data = self.df[self.column_thresholds.keys()].astype(str).values.flatten()  
+        self.tfidf_scores = self._create_tfidf_matrix(data)
+        self.common_affixes = self.find_common_prefixes_and_postfixes(data)
+        # Fit vectorizer on the entire dataset
+        global_vectorizer = CountVectorizer(tokenizer=lambda text: self.custom_tokenizer(text), preprocessor=None, lowercase=False, token_pattern=None)
+        global_vectorizer.fit(self.df[self.column_thresholds.keys()].astype(str).values.flatten())
 
         for column, params in self.column_thresholds.items():
             threshold = params['threshold']
             similarity_method = params.get('similarity_method', 'tfidf')
-            data = self.df[column].tolist()
-            if similarity_method == 'tfidf':
-                self.tfidf_scores = self._create_tfidf_matrix(data)
-                self.common_affixes = self.find_common_prefixes_and_postfixes(data)
+            data = self.df[column].astype(str).tolist()
+            # if similarity_method == 'tfidf':
+            #     self.tfidf_scores = self._create_tfidf_matrix(data)
+            #     self.common_affixes = self.find_common_prefixes_and_postfixes(data)
             
             grouped_processed_dfs = pd.DataFrame(columns=['idx1', 'idx2', f"{column}_similarity"])
 
@@ -265,7 +274,7 @@ class Entity_Fusion:
 
                 for group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
                     if len(group) > 1:
-                        grouped_processed_df = self._create_similarity_matrix(group, column, threshold, similarity_method, progress_bar=False)
+                        grouped_processed_df = self._create_similarity_matrix(group, column, threshold, similarity_method, global_vectorizer, progress_bar=False)
                         if not grouped_processed_df.empty:
                             grouped_processed_df.rename(columns={
                                 f"{column}_1_index": "idx1",
@@ -275,7 +284,7 @@ class Entity_Fusion:
                             grouped_processed_df = grouped_processed_df[['idx1', 'idx2', f"{column}_similarity"]]
                             grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
             else:
-                grouped_processed_df = self._create_similarity_matrix(self.df, column, threshold, similarity_method)
+                grouped_processed_df = self._create_similarity_matrix(self.df, column, threshold, similarity_method, global_vectorizer)
                 if not grouped_processed_df.empty:
                     grouped_processed_df.rename(columns={
                         f"{column}_1_index": "idx1",
