@@ -173,61 +173,49 @@ class Entity_Fusion:
         )
         return sim_df
     
-    def create_similarity_matrices(self, sample_fraction=0.1, max_sample_size=10000):
+    def create_similarity_matrices(self):
 
         processed_dfs = []
         for column, params in self.column_thresholds.items():
-            
+            df = self.df[self.df[column].notnull()].reset_index()
             similarity_method = params.get('similarity_method', 'tfidf')
-            data = self.df[self.df[column].notnull()][column].tolist()
+            data = df[column].tolist()
             if similarity_method == 'numeric':
-                vectorizer = TfidfVectorizer(tokenizer=lambda x: re.findall(r'\d+', x), preprocessor=None, lowercase=False, token_pattern=None)
+                vectorizer = TfidfVectorizer(tokenizer=lambda x: re.findall(r'\d+', x), preprocessor=None, lowercase=False)
             elif similarity_method == 'tfidf':
                 vectorizer = TfidfVectorizer(preprocessor=None, lowercase=False, ngram_range=(2, 3), norm='l2', smooth_idf=True, use_idf=True, stop_words='english')
             X_tfidf = vectorizer.fit_transform(data)
             
+            def group_dataframe(df, criterion):
+                if params.get('blocking_criteria') is not None:
+                    grouped_data = [df]
+                    for criterion in params.get('blocking_criteria', None):
+                        new_groups = []
+                        for group in grouped_data:
+                            if criterion == 'first_letter':
+                                new_groups.extend(list(group.groupby(group[column].str[0])))
+                            elif criterion == 'blocking_column':
+                                blocking_columns = params.get('blocking_column')
+                                if isinstance(blocking_columns, list):
+                                    for blocking_column in blocking_columns:
+                                        new_groups.extend(list(group.groupby(group[blocking_column])))
+                                else:
+                                    new_groups.extend(list(group.groupby(group[blocking_columns])))
+                            else:
+                                raise ValueError(f"Unsupported criterion: {criterion}")
+                        grouped_data = [grp for _, grp in new_groups if len(grp) > 1] # group size must be greater than 1
+                        return grouped_data
+                else:
+                    return [df]
+                
+            grouped_data = group_dataframe(df, params)
             grouped_processed_dfs = pd.DataFrame(columns=['idx1', 'idx2', f"{column}_similarity"])
             
-            # Create groups if blocking is enabled
-            if params.get('block', False):
-                grouped_data = [self.df]
-                for criterion in params['criteria']:
-                    new_groups = []
-                    for group in grouped_data:
-                        if criterion == 'first_letter':
-                            new_groups.extend(list(group.groupby(group[column].str[0])))
-                        elif criterion == 'blocking_column':
-                            blocking_columns = params.get('blocking_column')
-                            if isinstance(blocking_columns, list):
-                                for blocking_column in blocking_columns:
-                                    new_groups.extend(list(group.groupby(group[blocking_column])))
-                            else:
-                                new_groups.extend(list(group.groupby(group[blocking_columns])))
-                        else:
-                            raise ValueError(f"Unsupported criterion: {criterion}")
-                    grouped_data = [grp for _, grp in new_groups]
-
-                for group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
-                    if len(group) > 1:
-                        group_indices = group.index.tolist()
-                        group_tfidf = X_tfidf[group_indices, :]
-                        grouped_processed_df = self._create_similarity_matrix(group_tfidf, group_indices, column, params['threshold'], progress_bar=False)
-                        # grouped_processed_df = self._create_similarity_matrix(group, column, threshold, column_vectorizer, progress_bar=False)
-                        if not grouped_processed_df.empty:
-                            grouped_processed_df.rename(columns={
-                                f"{column}_1_index": "idx1",
-                                f"{column}_2_index": "idx2",
-                                f"{column}_similarity": f"{column}_similarity"
-                            }, inplace=True)
-                            grouped_processed_df = grouped_processed_df[['idx1', 'idx2', f"{column}_similarity"]]
-                            grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
-                        else:
-                            continue
-            else:
-                group_indices = data.index.tolist()
+            for group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
+                group_indices = group.index.tolist()
                 group_tfidf = X_tfidf[group_indices, :]
-                grouped_processed_df = self._create_similarity_matrix(X_tfidf, column, params['threshold'], progress_bar=True)
-                # grouped_processed_df = self._create_similarity_matrix(self.df, column, threshold, column_vectorizer, progress_bar=True)
+                grouped_processed_df = self._create_similarity_matrix(group_tfidf, group_indices, column, params['threshold'], progress_bar=False)
+                # grouped_processed_df = self._create_similarity_matrix(group, column, threshold, column_vectorizer, progress_bar=False)
                 if not grouped_processed_df.empty:
                     grouped_processed_df.rename(columns={
                         f"{column}_1_index": "idx1",
@@ -236,6 +224,57 @@ class Entity_Fusion:
                     }, inplace=True)
                     grouped_processed_df = grouped_processed_df[['idx1', 'idx2', f"{column}_similarity"]]
                     grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
+                else:
+                    continue
+            
+            # # Create groups if blocking is enabled
+            # if params.get('block', False):
+            #     grouped_data = [self.df]
+            #     for criterion in params['criteria']:
+            #         new_groups = []
+            #         for group in grouped_data:
+            #             if criterion == 'first_letter':
+            #                 new_groups.extend(list(group.groupby(group[column].str[0])))
+            #             elif criterion == 'blocking_column':
+            #                 blocking_columns = params.get('blocking_column')
+            #                 if isinstance(blocking_columns, list):
+            #                     for blocking_column in blocking_columns:
+            #                         new_groups.extend(list(group.groupby(group[blocking_column])))
+            #                 else:
+            #                     new_groups.extend(list(group.groupby(group[blocking_columns])))
+            #             else:
+            #                 raise ValueError(f"Unsupported criterion: {criterion}")
+            #         grouped_data = [grp for _, grp in new_groups]
+
+            # for group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
+            #     if len(group) > 1:
+            #         group_indices = group.index.tolist()
+            #         group_tfidf = X_tfidf[group_indices, :]
+            #         grouped_processed_df = self._create_similarity_matrix(group_tfidf, group_indices, column, params['threshold'], progress_bar=False)
+            #         # grouped_processed_df = self._create_similarity_matrix(group, column, threshold, column_vectorizer, progress_bar=False)
+            #         if not grouped_processed_df.empty:
+            #             grouped_processed_df.rename(columns={
+            #                 f"{column}_1_index": "idx1",
+            #                 f"{column}_2_index": "idx2",
+            #                 f"{column}_similarity": f"{column}_similarity"
+            #             }, inplace=True)
+            #             grouped_processed_df = grouped_processed_df[['idx1', 'idx2', f"{column}_similarity"]]
+            #             grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
+            #         else:
+            #             continue
+            # else:
+            #     group_indices = data.index.tolist()
+            #     group_tfidf = X_tfidf[group_indices, :]
+            #     grouped_processed_df = self._create_similarity_matrix(X_tfidf, column, params['threshold'], progress_bar=True)
+            #     # grouped_processed_df = self._create_similarity_matrix(self.df, column, threshold, column_vectorizer, progress_bar=True)
+            #     if not grouped_processed_df.empty:
+            #         grouped_processed_df.rename(columns={
+            #             f"{column}_1_index": "idx1",
+            #             f"{column}_2_index": "idx2",
+            #             f"{column}_similarity": f"{column}_similarity"
+            #         }, inplace=True)
+            #         grouped_processed_df = grouped_processed_df[['idx1', 'idx2', f"{column}_similarity"]]
+            #         grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
 
             if grouped_processed_dfs.empty:
                 grouped_processed_dfs = pd.DataFrame(columns=[
