@@ -14,6 +14,7 @@ import plotly.graph_objects as go
 from IPython.display import display
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 import re
+import random
 from collections import deque, Counter, defaultdict
 
 
@@ -33,20 +34,14 @@ class Entity_Fusion:
         if self.id_column not in self.df.columns:
             self.df[self.id_column] = range(1, len(self.df) + 1)
 
-    def levenshtein_similarity(self, a, b):
-        max_len = max(len(a), len(b))
-        if max_len == 0:
-            return 1.0
-        return (max_len - self.levenshtein_distance(a, b)) / max_len
-
-    def find_common_prefixes_and_postfixes(self, data, min_length=2):
+    def _find_common_prefixes_and_postfixes(self, data, min_length=2):
         threshold = 5
         all_words = [word for text in data for word in text.split()]
         word_counts = Counter(all_words)
         common_affixes = [word for word, count in word_counts.items() if count >= threshold and len(word) >= min_length]
         return common_affixes#common_prefixes, common_postfixes
 
-    def split_string_with_spaces(self, input_string):
+    def _split_string_with_spaces(self, input_string):
         """
         Split a string and add spaces before and after words that are in the middle.
         
@@ -70,38 +65,38 @@ class Entity_Fusion:
                 result.append(' ' + word + ' ')
         return result
 
-    def _create_tfidf_matrix(self, data):
-        vectorizer = TfidfVectorizer(
-            tokenizer=lambda text: self.split_string_with_spaces(text),
-            preprocessor=None,
-            lowercase=False,
-            sublinear_tf=True,
-            norm=None,
-            token_pattern=None,
-        )
-        vectorizer.fit(data)
-        # Get feature names
-        feature_names = vectorizer.get_feature_names_out()
-        # Get IDF values
-        idf_values = vectorizer.idf_
-        idf_scores = dict(zip(feature_names, idf_values))
-        # scaling_factor = 5  # Choose a factor to scale up the scores
-        idf_scores = {term: score for term, score in idf_scores.items()}
-        return idf_scores
+    # def _create_tfidf_matrix(self, data):
+    #     vectorizer = TfidfVectorizer(
+    #         tokenizer=lambda text: self._split_string_with_spaces(text),
+    #         preprocessor=None,
+    #         lowercase=False,
+    #         sublinear_tf=True,
+    #         norm=None,
+    #         token_pattern=None,
+    #     )
+    #     vectorizer.fit(data)
+    #     # Get feature names
+    #     feature_names = vectorizer.get_feature_names_out()
+    #     # Get IDF values
+    #     idf_values = vectorizer.idf_
+    #     idf_scores = dict(zip(feature_names, idf_values))
+    #     # scaling_factor = 5  # Choose a factor to scale up the scores
+    #     idf_scores = {term: score for term, score in idf_scores.items()}
+    #     return idf_scores
 
-    def custom_tokenizer(self, text):
-        words = self.split_string_with_spaces(text) 
+    def _custom_tokenizer(self, text):
+        words = self._split_string_with_spaces(text) 
         total_words = len(words)
         
-        # Use a more gradual dropoff for shorter strings
-        base = np.log(total_words + 1)
+        # # Use a more gradual dropoff for shorter strings
+        # base = np.log(total_words + 1)
         
-        # Calculate initial weights using logarithm and base
-        initial_weights = [1 / (np.log(i + 1) + base) ** 2 for i in range(1, total_words + 1)]
+        # # Calculate initial weights using logarithm and base
+        # initial_weights = [1 / (np.log(i + 1) + base) ** 2 for i in range(1, total_words + 1)]
         
-        # Normalize weights so that the first weight is 1
-        first_weight = initial_weights[0]
-        word_weights = [weight / first_weight for weight in initial_weights]
+        # # Normalize weights so that the first weight is 1
+        # first_weight = initial_weights[0]
+        # word_weights = [weight / first_weight for weight in initial_weights]
         word_weights = [1 for i in range(1, total_words + 1)]
 
         weighted_tokens = []
@@ -109,9 +104,9 @@ class Entity_Fusion:
             # Remove stopwords... 
             if word.lower().strip() in self.stopwords:
                 continue
-            if self.tfidf_scores is not None:
-                tfidf_weight = self.tfidf_scores.get(word, 1)
-                weight *= tfidf_weight
+            # if self.tfidf_scores is not None:
+            #     tfidf_weight = self.tfidf_scores.get(word, 1)
+            #     weight *= tfidf_weight
 
             # Reduce weight for common postfixes
             if word.strip() in self.common_affixes:
@@ -121,56 +116,39 @@ class Entity_Fusion:
                     weight *= 0.5
                     
             # Generate 2-word and 3-word tokens including spaces
-            if len(word) > 2:  # Ensure the word length is valid for bi-gram generation
-                tokens = [word[i:i+3] for i in range(len(word) - 2)]
+            if len(word) > 1:  # Ensure the word length is valid for bi-gram generation
+                tokens = [word[i:i+2] for i in range(len(word) - 1)]
                 for token in tokens:
-                    weighted_tokens.extend([token] * int(weight))# * 100))  # Adjust weight scaling as needed
-        
+                    weighted_tokens.extend([token] * int(weight * 5))# * 100))  # Adjust weight scaling as needed
+
         return weighted_tokens
 
-    def _create_similarity_matrix(self, group, column_name, threshold, similarity_method, global_vectorizer, progress_bar=True):
+    def _create_similarity_matrix(self, group, column_name, threshold, vectorizer, progress_bar=True):
         group[column_name] = group[column_name].astype(str)  # REMOVE NONETYPES OR SOMETHING
         data = group[column_name].tolist()
         original_indices = group.index.tolist()  # Keep track of the original indices
-
-        if len(data) <= 1:
-            # Skip processing for groups with only one row
-            return pd.DataFrame(columns=[
+        # Define Empty DataFrame which will be returned in case of empty data... etc
+        empty_dataframe = pd.DataFrame(columns=[
                 f"{column_name}_1_index",
                 f"{column_name}_2_index",
                 f"{column_name}_similarity",
             ])
 
-        if len(data) > 20_000:  # Turn progress bar on since data is large
+        if len(data) <= 1:
+            # Skip processing for groups with only one row
+            return empty_dataframe
+
+        if len(data) > 5_000:  # Turn progress bar on since data is large
             progress_bar = True
 
-        if similarity_method == 'tfidf':
-            try:
-                X_counts = global_vectorizer.transform(data)
-            except Exception as e:
-                print(e)
-                print(data)
-                return pd.DataFrame(columns=[
-                    f"{column_name}_1_index",
-                    f"{column_name}_2_index",
-                    f"{column_name}_similarity",
-                ])
-            # Transform the term-frequency matrix to a tf-idf representation
-            tfidf_transformer = TfidfTransformer(norm='l2', smooth_idf=True, use_idf=True)
-            X_tfidf = tfidf_transformer.fit_transform(X_counts)
-        elif similarity_method == 'numeric':
-            vectorizer = TfidfVectorizer(tokenizer=lambda x: re.findall(r'\d+', x), preprocessor=None, lowercase=False, token_pattern=None)
-            try:
-                X_tfidf = vectorizer.fit_transform(data)
-            except Exception as e:
-                print(e)
-                print(data)
-                return pd.DataFrame(columns=[
-                    f"{column_name}_1_index",
-                    f"{column_name}_2_index",
-                    f"{column_name}_similarity",
-                ])
-
+        # if similarity_method == 'tfidf':
+        try:
+            X_tfidf = vectorizer.transform(data)
+        except Exception as e:
+            print(e)
+            print(data)
+            return empty_dataframe
+        
         n_features = X_tfidf.shape[1]
         n_components = 1000
         n_components = min(n_features - 1, n_components)
@@ -189,7 +167,7 @@ class Entity_Fusion:
             chunk_matrix = np.where(mask, chunk_matrix, 0)
             return start_idx, end_idx, chunk_matrix
 
-        chunk_size = 500
+        chunk_size = 1000
         n_samples = X_tfidf.shape[0]
         cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
         cos_sim_desc = f"Computing cosine similarity in chunks for {column_name}"
@@ -236,28 +214,37 @@ class Entity_Fusion:
         return sim_df
     
     def create_similarity_matrices(self, sample_fraction=0.1, max_sample_size=10000):
+        
+        def create_vectorizer_from_sample(column, sample_fraction, max_sample_size, similarity_method='tfidf'):
+            # Create vectorizer
+            if similarity_method == 'numeric':
+                vectorizer = TfidfVectorizer(tokenizer=lambda x: re.findall(r'\d+', x), preprocessor=None, lowercase=False, token_pattern=None)
+            elif similarity_method == 'tfidf':
+                vectorizer = TfidfVectorizer(tokenizer=lambda text: self._custom_tokenizer(text), norm='l2', smooth_idf=True, use_idf=True, token_pattern=None)
+                # vectorizer = CountVectorizer(tokenizer=lambda text: self._custom_tokenizer(text), preprocessor=None, lowercase=False, token_pattern=None)
+                
+            # Create sample
+            # sample_size = min(int(len(self.df) * sample_fraction), max_sample_size)
+            # sample_data = self.df[self.df[column].notnull()][column].sample(sample_size, random_state=42)
+            
+            sample_data = self.df[self.df[column].notnull()][column]
+            vectorizer.fit(sample_data)
+            return vectorizer
+        
+        
         processed_dfs = []
-        data = self.df[self.column_thresholds.keys()].astype(str).values.flatten()  
-        self.tfidf_scores = self._create_tfidf_matrix(data)
-        self.common_affixes = self.find_common_prefixes_and_postfixes(data)
-        # Sample data to fit the global vectorizer
-        sample_size = min(int(len(self.df) * sample_fraction), max_sample_size)
-        sample_df = self.df.sample(n=sample_size, random_state=42)
-        # pdb.set_trace()
-        # Fit vectorizer on the sample dataset
-        global_vectorizer = CountVectorizer(tokenizer=lambda text: self.custom_tokenizer(text), preprocessor=None, lowercase=False, token_pattern=None)
-        global_vectorizer.fit(sample_df[self.column_thresholds.keys()].astype(str).values.flatten())
-
         for column, params in self.column_thresholds.items():
             threshold = params['threshold']
             similarity_method = params.get('similarity_method', 'tfidf')
             data = self.df[column].astype(str).tolist()
-            # if similarity_method == 'tfidf':
-            #     self.tfidf_scores = self._create_tfidf_matrix(data)
-            #     self.common_affixes = self.find_common_prefixes_and_postfixes(data)
-            
+            if similarity_method == 'tfidf':
+                # self.tfidf_scores = self._create_tfidf_matrix(data)
+                self.common_affixes = self._find_common_prefixes_and_postfixes(data)
+                
+            column_vectorizer = create_vectorizer_from_sample(column, sample_fraction, max_sample_size, similarity_method)
+            # pdb.set_trace()
             grouped_processed_dfs = pd.DataFrame(columns=['idx1', 'idx2', f"{column}_similarity"])
-
+            # Create groups if blocking is enabled
             if params.get('block', False):
                 grouped_data = [self.df]
                 for criterion in params['criteria']:
@@ -278,7 +265,7 @@ class Entity_Fusion:
 
                 for group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
                     if len(group) > 1:
-                        grouped_processed_df = self._create_similarity_matrix(group, column, threshold, similarity_method, global_vectorizer, progress_bar=False)
+                        grouped_processed_df = self._create_similarity_matrix(group, column, threshold, column_vectorizer, progress_bar=False)
                         if not grouped_processed_df.empty:
                             grouped_processed_df.rename(columns={
                                 f"{column}_1_index": "idx1",
@@ -287,8 +274,11 @@ class Entity_Fusion:
                             }, inplace=True)
                             grouped_processed_df = grouped_processed_df[['idx1', 'idx2', f"{column}_similarity"]]
                             grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
+                        else:
+                            continue
             else:
-                grouped_processed_df = self._create_similarity_matrix(self.df, column, threshold, similarity_method, global_vectorizer)
+                pdb.set_trace()
+                grouped_processed_df = self._create_similarity_matrix(self.df, column, threshold, column_vectorizer, progress_bar=True)
                 if not grouped_processed_df.empty:
                     grouped_processed_df.rename(columns={
                         f"{column}_1_index": "idx1",
@@ -327,7 +317,6 @@ class Entity_Fusion:
         df_sim = df_sim.fillna(0)
         self.df_sim = df_sim
         return df_sim
-
 
     def _construct_similarity_graph(self):
         print('Computing similarity graph...')
@@ -423,26 +412,6 @@ class Entity_Fusion:
 
         return cluster_map
     
-    def update_clusters_with_post_clustered(self, df_post_clustered):
-        # Define key columns (all except the last column which is assumed to be 'cluster_label')
-        key_columns = df_post_clustered.columns[:-1].tolist()
-        
-        # Create a dictionary mapping the key column values to the cluster_label
-        # Use tuples of key columns for creating the mapping
-        post_clustered_map = df_post_clustered.set_index(key_columns)['cluster_label'].to_dict()
-        
-        # Function to create a tuple of key column values for each row
-        def create_key_tuple(row):
-            return tuple(row[key_columns])
-        
-        # Apply the function to create a tuple key for each row in the original DataFrame
-        self.df['key_tuple'] = self.df.apply(create_key_tuple, axis=1)
-        
-        # Update the cluster labels in the original DataFrame based on the post-clustered DataFrame
-        self.df['cluster_label'] = self.df['key_tuple'].map(post_clustered_map).combine_first(self.df['cluster_label'])
-        
-        # Clean up the key tuple column
-        self.df.drop(columns=['key_tuple'], inplace=True)
 
     def cluster_data(self):
         self.create_similarity_matrices()
@@ -568,3 +537,26 @@ class Entity_Fusion:
                             yaxis=dict(showgrid=False, zeroline=False, showticklabels=False))
                         )
         display(fig)
+        
+        
+        
+    # def update_clusters_with_post_clustered(self, df_post_clustered):
+    #     # Define key columns (all except the last column which is assumed to be 'cluster_label')
+    #     key_columns = df_post_clustered.columns[:-1].tolist()
+        
+    #     # Create a dictionary mapping the key column values to the cluster_label
+    #     # Use tuples of key columns for creating the mapping
+    #     post_clustered_map = df_post_clustered.set_index(key_columns)['cluster_label'].to_dict()
+        
+    #     # Function to create a tuple of key column values for each row
+    #     def create_key_tuple(row):
+    #         return tuple(row[key_columns])
+        
+    #     # Apply the function to create a tuple key for each row in the original DataFrame
+    #     self.df['key_tuple'] = self.df.apply(create_key_tuple, axis=1)
+        
+    #     # Update the cluster labels in the original DataFrame based on the post-clustered DataFrame
+    #     self.df['cluster_label'] = self.df['key_tuple'].map(post_clustered_map).combine_first(self.df['cluster_label'])
+        
+    #     # Clean up the key tuple column
+    #     self.df.drop(columns=['key_tuple'], inplace=True)
