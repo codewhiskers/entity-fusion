@@ -123,10 +123,10 @@ class Entity_Fusion:
 
         return weighted_tokens
 
-    def _create_similarity_matrix(self, group, column_name, threshold, vectorizer, progress_bar=True):
-        group[column_name] = group[column_name].astype(str)  # REMOVE NONETYPES OR SOMETHING
-        data = group[column_name].tolist()
-        original_indices = group.index.tolist()  # Keep track of the original indices
+    def _create_similarity_matrix(self, group_tfidf, group_indices, column_name, threshold, progress_bar=True):
+        # group[column_name] = group[column_name].astype(str)  # REMOVE NONETYPES OR SOMETHING
+        # data = group[column_name].tolist()
+        # original_indices = group.index.tolist()  # Keep track of the original indices
         # Define Empty DataFrame which will be returned in case of empty data... etc
         empty_dataframe = pd.DataFrame(columns=[
                 f"{column_name}_1_index",
@@ -134,29 +134,28 @@ class Entity_Fusion:
                 f"{column_name}_similarity",
             ])
 
-        if len(data) <= 1:
-            # Skip processing for groups with only one row
-            return empty_dataframe
+        # if len(group_tfidf) <= 1:
+        #     # Skip processing for groups with only one row
+        #     return empty_dataframe
 
-        if len(data) > 5_000:  # Turn progress bar on since data is large
+        if group_tfidf.shape[0] > 5_000:  # Turn progress bar on since data is large
             progress_bar = True
 
         # if similarity_method == 'tfidf':
-        try:
-            X_tfidf = vectorizer.transform(data)
-        except Exception as e:
-            print(e)
-            print(data)
-            return empty_dataframe
-        
-        n_features = X_tfidf.shape[1]
-        n_components = 1000
+        # try:
+        #     X_tfidf = vectorizer.transform(data)
+        # except Exception as e:
+        #     print(e)
+        #     print(data)
+        #     return empty_dataframe
+        n_features = group_tfidf.shape[1]
+        n_components = 1500
         n_components = min(n_features - 1, n_components)
         if n_components > 1:
             while n_components > 1:
                 try:
                     svd = TruncatedSVD(n_components=n_components, random_state=42)
-                    X_tfidf = svd.fit_transform(X_tfidf)
+                    group_tfidf = svd.fit_transform(group_tfidf)
                     break
                 except:
                     n_components = n_components // 2
@@ -168,22 +167,22 @@ class Entity_Fusion:
             return start_idx, end_idx, chunk_matrix
 
         chunk_size = 1000
-        n_samples = X_tfidf.shape[0]
+        n_samples = group_tfidf.shape[0]
         cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
         cos_sim_desc = f"Computing cosine similarity in chunks for {column_name}"
         if progress_bar:
             for start_idx in tqdm(range(0, n_samples, chunk_size), desc=cos_sim_desc, leave=False):
                 end_idx = min(start_idx + chunk_size, n_samples)
-                start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, X_tfidf, threshold)
+                start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, group_tfidf, threshold)
                 cos_sim_sparse[start_idx:end_idx] = chunk_matrix
         else:
             for start_idx in range(0, n_samples, chunk_size):
                 end_idx = min(start_idx + chunk_size, n_samples)
-                start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, X_tfidf, threshold)
+                start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, group_tfidf, threshold)
                 cos_sim_sparse[start_idx:end_idx] = chunk_matrix
 
         cos_sim_sparse = cos_sim_sparse.tocsr()
-
+        # pdb.set_trace()
         coo = coo_matrix(cos_sim_sparse)
         rows, cols, values = coo.row, coo.col, coo.data
         if progress_bar:
@@ -196,12 +195,12 @@ class Entity_Fusion:
                 leave=False
             ):
                 if i != j:
-                    all_similarities.append([original_indices[i], original_indices[j], value])
+                    all_similarities.append([group_indices[i], group_indices[j], value])
         else:
             all_similarities = []
             for i, j, value in zip(rows, cols, values):
                 if i != j:
-                    all_similarities.append([original_indices[i], original_indices[j], value])
+                    all_similarities.append([group_indices[i], group_indices[j], value])
 
         sim_df = pd.DataFrame(
             all_similarities,
@@ -228,22 +227,22 @@ class Entity_Fusion:
             # sample_data = self.df[self.df[column].notnull()][column].sample(sample_size, random_state=42)
             
             sample_data = self.df[self.df[column].notnull()][column]
-            vectorizer.fit(sample_data)
-            return vectorizer
+            X_tfidf = vectorizer.fit_transform(sample_data)
+            return X_tfidf
         
         
         processed_dfs = []
         for column, params in self.column_thresholds.items():
-            threshold = params['threshold']
+            
             similarity_method = params.get('similarity_method', 'tfidf')
             data = self.df[column].astype(str).tolist()
             if similarity_method == 'tfidf':
                 # self.tfidf_scores = self._create_tfidf_matrix(data)
                 self.common_affixes = self._find_common_prefixes_and_postfixes(data)
                 
-            column_vectorizer = create_vectorizer_from_sample(column, sample_fraction, max_sample_size, similarity_method)
-            # pdb.set_trace()
+            X_tfidf = create_vectorizer_from_sample(column, sample_fraction, max_sample_size, similarity_method)
             grouped_processed_dfs = pd.DataFrame(columns=['idx1', 'idx2', f"{column}_similarity"])
+            
             # Create groups if blocking is enabled
             if params.get('block', False):
                 grouped_data = [self.df]
@@ -265,7 +264,10 @@ class Entity_Fusion:
 
                 for group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
                     if len(group) > 1:
-                        grouped_processed_df = self._create_similarity_matrix(group, column, threshold, column_vectorizer, progress_bar=False)
+                        group_indices = group.index.tolist()
+                        group_tfidf = X_tfidf[group_indices, :]
+                        grouped_processed_df = self._create_similarity_matrix(group_tfidf, group_indices, column, params['threshold'], progress_bar=False)
+                        # grouped_processed_df = self._create_similarity_matrix(group, column, threshold, column_vectorizer, progress_bar=False)
                         if not grouped_processed_df.empty:
                             grouped_processed_df.rename(columns={
                                 f"{column}_1_index": "idx1",
@@ -277,8 +279,10 @@ class Entity_Fusion:
                         else:
                             continue
             else:
-                pdb.set_trace()
-                grouped_processed_df = self._create_similarity_matrix(self.df, column, threshold, column_vectorizer, progress_bar=True)
+                group_indices = data.index.tolist()
+                group_tfidf = X_tfidf[group_indices, :]
+                grouped_processed_df = self._create_similarity_matrix(X_tfidf, column, params['threshold'], progress_bar=True)
+                # grouped_processed_df = self._create_similarity_matrix(self.df, column, threshold, column_vectorizer, progress_bar=True)
                 if not grouped_processed_df.empty:
                     grouped_processed_df.rename(columns={
                         f"{column}_1_index": "idx1",
