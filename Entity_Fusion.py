@@ -65,40 +65,6 @@ class Entity_Fusion:
                 result.append(' ' + word + ' ')
         return result
 
-    # def _custom_tokenizer(self, text):
-    #     words = self._split_string_with_spaces(text) 
-    #     total_words = len(words)
-        
-    #     # # Use a more gradual dropoff for shorter strings
-    #     # base = np.log(total_words + 1)
-        
-    #     # # Calculate initial weights using logarithm and base
-    #     # initial_weights = [1 / (np.log(i + 1) + base) ** 2 for i in range(1, total_words + 1)]
-        
-    #     # # Normalize weights so that the first weight is 1
-    #     # first_weight = initial_weights[0]
-    #     # word_weights = [weight / first_weight for weight in initial_weights]
-    #     word_weights = [1 for i in range(1, total_words + 1)]
-
-    #     weighted_tokens = []
-    #     for word, weight in zip(words, word_weights):
-    #         # Remove stopwords... 
-    #         # if word.lower().strip() in self.stopwords:
-    #         #     continue
-    #         # Reduce weight for common postfixes
-    #         if word.strip() in self.common_affixes:
-    #             if word == words[-1]:
-    #                 weight *= 0.5
-    #             if word == words[0]:
-    #                 weight *= 0.75
-                    
-    #         # Generate 2-word and 3-word tokens including spaces
-    #         if len(word) > 2:  # Ensure the word length is valid for bi-gram generation
-    #             tokens = [word[i:i+3] for i in range(len(word) - 2)]
-    #             for token in tokens:
-    #                 weighted_tokens.extend([token] * int(weight * 10))# * 100))  # Adjust weight scaling as needed
-    #     return weighted_tokens
-
     def _create_similarity_matrix(self, group_tfidf, group_indices, column_name, threshold, progress_bar=True):
         # Define Empty DataFrame which will be returned in case of empty data... etc
         empty_dataframe = pd.DataFrame(columns=[
@@ -109,18 +75,6 @@ class Entity_Fusion:
 
         if group_tfidf.shape[0] > 5_000:  # Turn progress bar on since data is large
             progress_bar = True
-
-        # n_features = group_tfidf.shape[1]
-        # n_components = 1500
-        # n_components = min(n_features - 1, n_components)
-        # if n_components > 1:
-        #     while n_components > 1:
-        #         try:
-        #             svd = TruncatedSVD(n_components=n_components, random_state=42)
-        #             group_tfidf = svd.fit_transform(group_tfidf)
-        #             break
-        #         except:
-        #             n_components = n_components // 2
 
         def compute_cosine_similarity_chunk(start_idx, end_idx, X_reduced, threshold):
             chunk_matrix = cosine_similarity(X_reduced[start_idx:end_idx], X_reduced)
@@ -226,56 +180,7 @@ class Entity_Fusion:
                     grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
                 else:
                     continue
-            
-            # # Create groups if blocking is enabled
-            # if params.get('block', False):
-            #     grouped_data = [self.df]
-            #     for criterion in params['criteria']:
-            #         new_groups = []
-            #         for group in grouped_data:
-            #             if criterion == 'first_letter':
-            #                 new_groups.extend(list(group.groupby(group[column].str[0])))
-            #             elif criterion == 'blocking_column':
-            #                 blocking_columns = params.get('blocking_column')
-            #                 if isinstance(blocking_columns, list):
-            #                     for blocking_column in blocking_columns:
-            #                         new_groups.extend(list(group.groupby(group[blocking_column])))
-            #                 else:
-            #                     new_groups.extend(list(group.groupby(group[blocking_columns])))
-            #             else:
-            #                 raise ValueError(f"Unsupported criterion: {criterion}")
-            #         grouped_data = [grp for _, grp in new_groups]
-
-            # for group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
-            #     if len(group) > 1:
-            #         group_indices = group.index.tolist()
-            #         group_tfidf = X_tfidf[group_indices, :]
-            #         grouped_processed_df = self._create_similarity_matrix(group_tfidf, group_indices, column, params['threshold'], progress_bar=False)
-            #         # grouped_processed_df = self._create_similarity_matrix(group, column, threshold, column_vectorizer, progress_bar=False)
-            #         if not grouped_processed_df.empty:
-            #             grouped_processed_df.rename(columns={
-            #                 f"{column}_1_index": "idx1",
-            #                 f"{column}_2_index": "idx2",
-            #                 f"{column}_similarity": f"{column}_similarity"
-            #             }, inplace=True)
-            #             grouped_processed_df = grouped_processed_df[['idx1', 'idx2', f"{column}_similarity"]]
-            #             grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
-            #         else:
-            #             continue
-            # else:
-            #     group_indices = data.index.tolist()
-            #     group_tfidf = X_tfidf[group_indices, :]
-            #     grouped_processed_df = self._create_similarity_matrix(X_tfidf, column, params['threshold'], progress_bar=True)
-            #     # grouped_processed_df = self._create_similarity_matrix(self.df, column, threshold, column_vectorizer, progress_bar=True)
-            #     if not grouped_processed_df.empty:
-            #         grouped_processed_df.rename(columns={
-            #             f"{column}_1_index": "idx1",
-            #             f"{column}_2_index": "idx2",
-            #             f"{column}_similarity": f"{column}_similarity"
-            #         }, inplace=True)
-            #         grouped_processed_df = grouped_processed_df[['idx1', 'idx2', f"{column}_similarity"]]
-            #         grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
-
+                
             if grouped_processed_dfs.empty:
                 grouped_processed_dfs = pd.DataFrame(columns=[
                     "idx1",
@@ -348,7 +253,6 @@ class Entity_Fusion:
         idx1 = filtered_df["idx1"].astype(int)
         idx2 = filtered_df["idx2"].astype(int)
         edges = list(zip(idx1, idx2))
-
 
         # Add edges to the graph with a progress bar
         for edge in tqdm(edges, desc="Adding edges to the graph"):
@@ -548,3 +452,39 @@ class Entity_Fusion:
         
     #     # Clean up the key tuple column
     #     self.df.drop(columns=['key_tuple'], inplace=True)
+    
+    
+    
+    # def _custom_tokenizer(self, text):
+    #     words = self._split_string_with_spaces(text) 
+    #     total_words = len(words)
+        
+    #     # # Use a more gradual dropoff for shorter strings
+    #     # base = np.log(total_words + 1)
+        
+    #     # # Calculate initial weights using logarithm and base
+    #     # initial_weights = [1 / (np.log(i + 1) + base) ** 2 for i in range(1, total_words + 1)]
+        
+    #     # # Normalize weights so that the first weight is 1
+    #     # first_weight = initial_weights[0]
+    #     # word_weights = [weight / first_weight for weight in initial_weights]
+    #     word_weights = [1 for i in range(1, total_words + 1)]
+
+    #     weighted_tokens = []
+    #     for word, weight in zip(words, word_weights):
+    #         # Remove stopwords... 
+    #         # if word.lower().strip() in self.stopwords:
+    #         #     continue
+    #         # Reduce weight for common postfixes
+    #         if word.strip() in self.common_affixes:
+    #             if word == words[-1]:
+    #                 weight *= 0.5
+    #             if word == words[0]:
+    #                 weight *= 0.75
+                    
+    #         # Generate 2-word and 3-word tokens including spaces
+    #         if len(word) > 2:  # Ensure the word length is valid for bi-gram generation
+    #             tokens = [word[i:i+3] for i in range(len(word) - 2)]
+    #             for token in tokens:
+    #                 weighted_tokens.extend([token] * int(weight * 10))# * 100))  # Adjust weight scaling as needed
+    #     return weighted_tokens
