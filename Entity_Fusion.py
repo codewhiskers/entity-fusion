@@ -66,7 +66,7 @@ class Entity_Fusion:
             
         #     return start_idx, end_idx, chunk_matrix
 
-        chunk_size = 500
+        chunk_size = 2_000
         n_samples = group_tfidf.shape[0]
         cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
         if blocking_value:
@@ -102,11 +102,13 @@ class Entity_Fusion:
     def create_similarity_matrices(self):
         processed_dfs = []
         for column, params in self.column_thresholds.items():
-            df = self.df[self.df[column].notnull()].reset_index()
+            # df = self.df[self.df[column].notnull()].reset_index()
+            self.df.fillna('None', inplace=True)
+            df = self.df.copy()
             similarity_method = params.get('similarity_method', 'tfidf')
             data = df[column].tolist()
             if similarity_method == 'numeric':
-                vectorizer = TfidfVectorizer(tokenizer=lambda x: re.findall(r'\d+', x), preprocessor=None, lowercase=False)
+                vectorizer = TfidfVectorizer(tokenizer=lambda x: re.findall(r'\d+', x), preprocessor=None, lowercase=False, stop_words='english')
             elif similarity_method == 'tfidf':
                 vectorizer = TfidfVectorizer(preprocessor=None, lowercase=False, ngram_range=(2, 3), norm='l2', smooth_idf=True, use_idf=True, stop_words='english')
             X_tfidf = vectorizer.fit_transform(data)
