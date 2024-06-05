@@ -16,6 +16,7 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 import re
 import random
 from collections import deque, Counter, defaultdict
+from sparse_dot_topn import sp_matmul_topn
 
 
 class Entity_Fusion:
@@ -41,38 +42,15 @@ class Entity_Fusion:
         common_affixes = [word for word, count in word_counts.items() if count >= threshold and len(word) >= min_length]
         return common_affixes#common_prefixes, common_postfixes
 
-    def _split_string_with_spaces(self, input_string):
-        """
-        Split a string and add spaces before and after words that are in the middle.
-        
-        Parameters:
-        input_string (str): The input string to split.
-        
-        Returns:
-        list: A list of words with added spaces before and after for middle words.
-        """
-        # Split the string by spaces
-        words = input_string.split()
-        
-        # Process each word to add spaces
-        result = []
-        for i, word in enumerate(words):
-            if i == 0:
-                result.append(word + ' ')
-            elif i == len(words) - 1:
-                result.append(' ' + word)
-            else:
-                result.append(' ' + word + ' ')
-        return result
+    def find_unclustered(self):
+        # Find the maximum existing cluster label
+        max_label = int(self.df['cluster_label'].max() if self.df['cluster_label'].max() is not None else -1)
+        # Assign new unique labels to unclustered fields
+        unclustered_mask = self.df['cluster_label'].isnull()
+        num_unclustered = int(unclustered_mask.sum())
+        self.df.loc[unclustered_mask, 'cluster_label'] = range(max_label + 1, max_label + 1 + num_unclustered)  # Assign new labels
 
-    def _create_similarity_matrix(self, group_tfidf, group_indices, column_name, threshold, progress_bar=True):
-        # Define Empty DataFrame which will be returned in case of empty data... etc
-        empty_dataframe = pd.DataFrame(columns=[
-                f"{column_name}_1_index",
-                f"{column_name}_2_index",
-                f"{column_name}_similarity",
-            ])
-
+    def _create_similarity_matrix(self, group_tfidf, group_indices, column_name, threshold, blocking_value=None, progress_bar=True):
         if group_tfidf.shape[0] > 5_000:  # Turn progress bar on since data is large
             progress_bar = True
 
@@ -82,40 +60,34 @@ class Entity_Fusion:
             chunk_matrix = np.where(mask, chunk_matrix, 0)
             return start_idx, end_idx, chunk_matrix
 
+        # def compute_cosine_similarity_chunk(start_idx, end_idx, group_tfidf, threshold, top_n=5, n_threads=2):
+        #     X_chunk = group_tfidf[start_idx:end_idx]
+        #     chunk_matrix = sp_matmul_topn(X_chunk, group_tfidf.T, top_n=top_n, threshold=threshold, n_threads=n_threads)
+            
+        #     return start_idx, end_idx, chunk_matrix
+
         chunk_size = 500
         n_samples = group_tfidf.shape[0]
         cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
-        cos_sim_desc = f"Computing cosine similarity in chunks for {column_name}"
-        if progress_bar:
-            for start_idx in tqdm(range(0, n_samples, chunk_size), desc=cos_sim_desc, leave=False):
-                end_idx = min(start_idx + chunk_size, n_samples)
-                start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, group_tfidf, threshold)
-                cos_sim_sparse[start_idx:end_idx] = chunk_matrix
+        if blocking_value:
+            cos_sim_desc = f"Computing cosine similarity in chunks for {column_name} (Blocking: {blocking_value})"
         else:
-            for start_idx in range(0, n_samples, chunk_size):
-                end_idx = min(start_idx + chunk_size, n_samples)
-                start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, group_tfidf, threshold)
-                cos_sim_sparse[start_idx:end_idx] = chunk_matrix
-    
+            cos_sim_desc = f"Computing cosine similarity in chunks for {column_name}"
+        loop_range = tqdm(range(0, n_samples, chunk_size), desc=cos_sim_desc, leave=False) if progress_bar else range(0, n_samples, chunk_size)
+
+        for start_idx in loop_range:
+            end_idx = min(start_idx + chunk_size, n_samples)
+            start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, group_tfidf, threshold)
+            cos_sim_sparse[start_idx:end_idx] = chunk_matrix
+
         cos_sim_sparse = cos_sim_sparse.tocsr()
         coo = coo_matrix(cos_sim_sparse)
         rows, cols, values = coo.row, coo.col, coo.data
-        if progress_bar:
-            process_sim_desc = f"Processing similarities for {column_name}"
-            all_similarities = []
-            for i, j, value in tqdm(
-                zip(rows, cols, values),
-                total=len(values),
-                desc=process_sim_desc,
-                leave=False
-            ):
-                if i != j:
-                    all_similarities.append([group_indices[i], group_indices[j], value])
-        else:
-            all_similarities = []
-            for i, j, value in zip(rows, cols, values):
-                if i != j:
-                    all_similarities.append([group_indices[i], group_indices[j], value])
+
+        all_similarities = []
+        for i, j, value in zip(rows, cols, values):
+            if i != j:
+                all_similarities.append([group_indices[i], group_indices[j], value])
 
         sim_df = pd.DataFrame(
             all_similarities,
@@ -128,7 +100,6 @@ class Entity_Fusion:
         return sim_df
     
     def create_similarity_matrices(self):
-
         processed_dfs = []
         for column, params in self.column_thresholds.items():
             df = self.df[self.df[column].notnull()].reset_index()
@@ -140,36 +111,41 @@ class Entity_Fusion:
                 vectorizer = TfidfVectorizer(preprocessor=None, lowercase=False, ngram_range=(2, 3), norm='l2', smooth_idf=True, use_idf=True, stop_words='english')
             X_tfidf = vectorizer.fit_transform(data)
             
-            def group_dataframe(df, criterion):
-                if params.get('blocking_criteria') is not None:
+            def group_dataframe(df, params):
+                blocking_criteria = params.get('blocking_criteria', None)
+                
+                if blocking_criteria is not None:
                     grouped_data = [df]
-                    for criterion in params.get('blocking_criteria', None):
+
+                    for criterion in blocking_criteria:
                         new_groups = []
                         for group in grouped_data:
                             if criterion == 'first_letter':
-                                new_groups.extend(list(group.groupby(group[column].str[0])))
+                                new_groups.extend(list(group.groupby(group[params['column']].str[0])))
                             elif criterion == 'blocking_column':
                                 blocking_columns = params.get('blocking_column')
                                 if isinstance(blocking_columns, list):
-                                    for blocking_column in blocking_columns:
-                                        new_groups.extend(list(group.groupby(group[blocking_column])))
+                                    new_groups.extend(list(group.groupby([group[col] for col in blocking_columns])))
                                 else:
                                     new_groups.extend(list(group.groupby(group[blocking_columns])))
                             else:
                                 raise ValueError(f"Unsupported criterion: {criterion}")
-                        grouped_data = [grp for _, grp in new_groups if len(grp) > 1] # group size must be greater than 1
-                        return grouped_data
+                        
+                        grouped_data = [grp for _, grp in new_groups if len(grp) > 1]  # group size must be greater than 1
+                    
+                    # Return grouped_data as a list of DataFrames and their respective group names
+                    return [(group_name, group) for group_name, group in new_groups]
                 else:
-                    return [df]
+                    return [(None, df)]
+
                 
             grouped_data = group_dataframe(df, params)
             grouped_processed_dfs = pd.DataFrame(columns=['idx1', 'idx2', f"{column}_similarity"])
             
-            for group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
+            for group_name, group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
                 group_indices = group.index.tolist()
                 group_tfidf = X_tfidf[group_indices, :]
-                grouped_processed_df = self._create_similarity_matrix(group_tfidf, group_indices, column, params['threshold'], progress_bar=False)
-                # grouped_processed_df = self._create_similarity_matrix(group, column, threshold, column_vectorizer, progress_bar=False)
+                grouped_processed_df = self._create_similarity_matrix(group_tfidf, group_indices, column, params['threshold'], blocking_value=group_name, progress_bar=False)
                 if not grouped_processed_df.empty:
                     grouped_processed_df.rename(columns={
                         f"{column}_1_index": "idx1",
@@ -180,13 +156,7 @@ class Entity_Fusion:
                     grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
                 else:
                     continue
-                
-            if grouped_processed_dfs.empty:
-                grouped_processed_dfs = pd.DataFrame(columns=[
-                    "idx1",
-                    "idx2",
-                    f"{column}_similarity",
-                ])
+
             processed_dfs.append(grouped_processed_dfs)
         
         # Incremental merge with debugging
@@ -310,6 +280,7 @@ class Entity_Fusion:
         self._construct_similarity_graph()
         self.clusters = self._find_clusters_from_graph(self.graph)
         self.df["cluster_label"] = self.df.index.map(self.clusters)
+        self.find_unclustered()
         return self.df
     
     def return_cluster_data_logic_dataframe(self):
@@ -488,3 +459,27 @@ class Entity_Fusion:
     #             for token in tokens:
     #                 weighted_tokens.extend([token] * int(weight * 10))# * 100))  # Adjust weight scaling as needed
     #     return weighted_tokens
+    
+        # def _split_string_with_spaces(self, input_string):
+        # """
+        # Split a string and add spaces before and after words that are in the middle.
+        
+        # Parameters:
+        # input_string (str): The input string to split.
+        
+        # Returns:
+        # list: A list of words with added spaces before and after for middle words.
+        # """
+        # # Split the string by spaces
+        # words = input_string.split()
+        
+        # # Process each word to add spaces
+        # result = []
+        # for i, word in enumerate(words):
+        #     if i == 0:
+        #         result.append(word + ' ')
+        #     elif i == len(words) - 1:
+        #         result.append(' ' + word)
+        #     else:
+        #         result.append(' ' + word + ' ')
+        # return result
