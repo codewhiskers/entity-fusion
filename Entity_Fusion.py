@@ -113,7 +113,7 @@ class Entity_Fusion:
                 vectorizer = TfidfVectorizer(preprocessor=None, lowercase=False, ngram_range=(2, 3), norm='l2', smooth_idf=True, use_idf=True, stop_words='english')
             X_tfidf = vectorizer.fit_transform(data)
             
-            def group_dataframe(df, params):
+            def group_dataframe(df, params, column):
                 blocking_criteria = params.get('blocking_criteria', None)
                 
                 if blocking_criteria is not None:
@@ -123,7 +123,7 @@ class Entity_Fusion:
                         new_groups = []
                         for group in grouped_data:
                             if criterion == 'first_letter':
-                                new_groups.extend(list(group.groupby(group[params['column']].str[0])))
+                                new_groups.extend(list(group.groupby(group[column].str[0])))
                             elif criterion == 'blocking_column':
                                 blocking_columns = params.get('blocking_column')
                                 if isinstance(blocking_columns, list):
@@ -135,13 +135,12 @@ class Entity_Fusion:
                         
                         grouped_data = [grp for _, grp in new_groups if len(grp) > 1]  # group size must be greater than 1
                     
-                    # Return grouped_data as a list of DataFrames and their respective group names
                     return [(group_name, group) for group_name, group in new_groups]
                 else:
                     return [(None, df)]
 
                 
-            grouped_data = group_dataframe(df, params)
+            grouped_data = group_dataframe(df, params, column)
             grouped_processed_dfs = pd.DataFrame(columns=['idx1', 'idx2', f"{column}_similarity"])
             
             for group_name, group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
