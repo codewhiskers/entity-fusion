@@ -50,7 +50,28 @@ class Entity_Fusion:
         num_unclustered = int(unclustered_mask.sum())
         self.df.loc[unclustered_mask, 'cluster_label'] = range(max_label + 1, max_label + 1 + num_unclustered)  # Assign new labels
 
-    def _create_similarity_matrix(self, group_tfidf, group_indices, column_name, threshold, blocking_value=None, progress_bar=True):
+    def _create_exact_match_matrix(self, data, column_name):
+        matches = []
+
+        for i in range(len(data)):
+            for j in range(i + 1, len(data)):
+                if data[i] == data[j]:
+                    matches.append([i, j, 1])
+
+        match_df = pd.DataFrame(
+            matches,
+            columns=[
+                f"{column_name}_1_index",
+                f"{column_name}_2_index",
+                f"{column_name}_similarity",
+            ],
+        )
+        return match_df
+
+    def _create_similarity_matrix(self, group_tfidf, group_indices, column_name, threshold, similarity_method, blocking_value=None, progress_bar=True):
+        if similarity_method == 'numeric_exact':
+            return self._create_exact_match_matrix(group_tfidf, column_name)
+        
         if group_tfidf.shape[0] > 5_000:  # Turn progress bar on since data is large
             progress_bar = True
 
@@ -102,16 +123,20 @@ class Entity_Fusion:
     def create_similarity_matrices(self):
         processed_dfs = []
         for column, params in self.column_thresholds.items():
-            # df = self.df[self.df[column].notnull()].reset_index()
-            self.df.fillna('None', inplace=True)
+            
             df = self.df.copy()
+            df[column] = df[column].astype(str)
             similarity_method = params.get('similarity_method', 'tfidf')
+            
             data = df[column].tolist()
             if similarity_method == 'numeric':
                 vectorizer = TfidfVectorizer(tokenizer=lambda x: re.findall(r'\d+', x), preprocessor=None, lowercase=False, stop_words='english')
+                X_tfidf = vectorizer.fit_transform(data)
             elif similarity_method == 'tfidf':
                 vectorizer = TfidfVectorizer(preprocessor=None, lowercase=False, ngram_range=(2, 3), norm='l2', smooth_idf=True, use_idf=True, stop_words='english')
-            X_tfidf = vectorizer.fit_transform(data)
+                X_tfidf = vectorizer.fit_transform(data)
+            elif similarity_method == 'numeric_exact':
+                X_tfidf = data
             
             def group_dataframe(df, params, column):
                 blocking_criteria = params.get('blocking_criteria', None)
@@ -144,9 +169,20 @@ class Entity_Fusion:
             grouped_processed_dfs = pd.DataFrame(columns=['idx1', 'idx2', f"{column}_similarity"])
             
             for group_name, group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
+                group = group[group[column].notnull()]
+                group = group.reset_index(drop=True)
+                
                 group_indices = group.index.tolist()
-                group_tfidf = X_tfidf[group_indices, :]
-                grouped_processed_df = self._create_similarity_matrix(group_tfidf, group_indices, column, params['threshold'], blocking_value=group_name, progress_bar=False)
+                
+                if similarity_method == 'numeric_exact':
+                    group_X = [data[df.index.get_loc(i)] for i in group_indices]
+                else:
+                    group_X = X_tfidf[df.index.get_indexer(group_indices), :]
+            
+                
+                # group_tfidf = X_tfidf[group_indices, :]
+                grouped_processed_df = self._create_similarity_matrix(group_X, group_indices, column, params['threshold'], similarity_method, blocking_value=group_name, progress_bar=False)
+                pdb.set_trace()
                 if not grouped_processed_df.empty:
                     grouped_processed_df.rename(columns={
                         f"{column}_1_index": "idx1",
