@@ -60,11 +60,18 @@ class Entity_Fusion:
 
     def _create_exact_match_matrix(self, data, group_indices, column_name):
         matches = []
+        value_to_indices = defaultdict(list)
 
-        for i in range(len(data)):
-            for j in range(i + 1, len(data)):
-                if data[i] == data[j]:
-                    matches.append([group_indices[i], group_indices[j], 1])
+        # Build a dictionary where the keys are data values and the values are lists of indices
+        for idx, value in enumerate(data):
+            value_to_indices[value].append(group_indices[idx])
+
+        # Iterate over the dictionary to create matches
+        for indices in tqdm(value_to_indices.values(), desc=f"Processing exact matches for {column_name}"):
+            if len(indices) > 1:
+                for i in range(len(indices)):
+                    for j in range(i + 1, len(indices)):
+                        matches.append([indices[i], indices[j], 1])
 
         match_df = pd.DataFrame(
             matches,
@@ -202,7 +209,7 @@ class Entity_Fusion:
         
         # Incremental merge with debugging
         def merge_dataframes(left_df, right_df):
-            print(f"Merging dataframes: {left_df.shape} with {right_df.shape}")
+            # print(f"Merging dataframes: {left_df.shape} with {right_df.shape}")
             return pd.merge(
                 left_df,
                 right_df,
@@ -217,7 +224,7 @@ class Entity_Fusion:
         df_sim = processed_dfs[0]
         for i in range(1, len(processed_dfs)):
             df_sim = merge_dataframes(df_sim, processed_dfs[i])
-            print(f"Merged DataFrame {i}: {df_sim.shape}")
+            # print(f"Merged DataFrame {i}: {df_sim.shape}")
         df_sim = df_sim.fillna(0)
         self.df_sim = df_sim
         return df_sim
@@ -229,7 +236,7 @@ class Entity_Fusion:
         # Create boolean masks for the conditions
         masks = []
         for col, params in self.column_thresholds.items():
-            print(f"Processing column: {col}")
+            # print(f"Processing column: {col}")
             masks.append(self.df_sim[f"{col}_similarity"] >= params['threshold'])
         
         if self.conditional == 'AND':
@@ -237,11 +244,11 @@ class Entity_Fusion:
         else:  # self.conditional == 'OR'
             final_mask = np.logical_or.reduce(masks)
 
-        print(f"Final mask: {final_mask}")
+        # print(f"Final mask: {final_mask}")
 
         # Use the final mask to filter the DataFrame
         filtered_df = self.df_sim[final_mask]
-        print(f"Filtered DataFrame: {filtered_df.shape}")
+        # print(f"Filtered DataFrame: {filtered_df.shape}")
 
         # Convert pre-clustered DataFrame to sets for quick lookup
         if self.pre_clustered_df is not None:
@@ -249,13 +256,13 @@ class Entity_Fusion:
                                 self.pre_clustered_df[self.pre_clustered_df['match'] == False]['id2']))
             reverse_exclude_set = set((y, x) for x, y in exclude_set)  # Create reverse pairs
             exclude_set.update(reverse_exclude_set)
-            print(f"Exclude set: {exclude_set}")
+            # print(f"Exclude set: {exclude_set}")
             
             include_set = set(zip(self.pre_clustered_df[self.pre_clustered_df['match'] == True]['id1'],
                                 self.pre_clustered_df[self.pre_clustered_df['match'] == True]['id2']))
             reverse_include_set = set((y, x) for x, y in include_set)  # Create reverse pairs
             include_set.update(reverse_include_set)
-            print(f"Include set: {include_set}")
+            # print(f"Include set: {include_set}")
         else:
             exclude_set = set()
             include_set = set()
