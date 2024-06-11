@@ -50,13 +50,13 @@ class Entity_Fusion:
         num_unclustered = int(unclustered_mask.sum())
         self.df.loc[unclustered_mask, 'cluster_label'] = range(max_label + 1, max_label + 1 + num_unclustered)  # Assign new labels
 
-    def _create_exact_match_matrix(self, data, column_name):
+    def _create_exact_match_matrix(self, data, group_indices, column_name):
         matches = []
 
         for i in range(len(data)):
             for j in range(i + 1, len(data)):
                 if data[i] == data[j]:
-                    matches.append([i, j, 1])
+                    matches.append([group_indices[i], group_indices[j], 1])
 
         match_df = pd.DataFrame(
             matches,
@@ -67,6 +67,7 @@ class Entity_Fusion:
             ],
         )
         return match_df
+
 
     def _create_similarity_matrix(self, group_tfidf, group_indices, column_name, threshold, similarity_method, blocking_value=None, progress_bar=True):
         if similarity_method == 'numeric_exact':
@@ -80,12 +81,6 @@ class Entity_Fusion:
             mask = chunk_matrix >= threshold
             chunk_matrix = np.where(mask, chunk_matrix, 0)
             return start_idx, end_idx, chunk_matrix
-
-        # def compute_cosine_similarity_chunk(start_idx, end_idx, group_tfidf, threshold, top_n=5, n_threads=2):
-        #     X_chunk = group_tfidf[start_idx:end_idx]
-        #     chunk_matrix = sp_matmul_topn(X_chunk, group_tfidf.T, top_n=top_n, threshold=threshold, n_threads=n_threads)
-            
-        #     return start_idx, end_idx, chunk_matrix
 
         chunk_size = 2_000
         n_samples = group_tfidf.shape[0]
@@ -123,7 +118,6 @@ class Entity_Fusion:
     def create_similarity_matrices(self):
         processed_dfs = []
         for column, params in self.column_thresholds.items():
-            
             df = self.df.copy()
             df[column] = df[column].astype(str)
             similarity_method = params.get('similarity_method', 'tfidf')
@@ -170,19 +164,22 @@ class Entity_Fusion:
             
             for group_name, group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
                 group = group[group[column].notnull()]
-                group = group.reset_index(drop=True)
+                group = group[group[column] != '']
+                group = group[group[column] != 'nan']
+                group = group[group[column] != 'None']
                 
-                group_indices = group.index.tolist()
-                
-                if similarity_method == 'numeric_exact':
-                    group_X = [data[df.index.get_loc(i)] for i in group_indices]
-                else:
-                    group_X = X_tfidf[df.index.get_indexer(group_indices), :]
+                if similarity_method == 'tfidf':
+                    group_indices = group.index.tolist()
+                    group_tfidf = X_tfidf[group_indices, :]
+                elif similarity_method == 'numeric':
+                    group_indices = group.index.tolist()
+                    group_tfidf = X_tfidf[group_indices, :]
+                elif similarity_method == 'numeric_exact': 
+                    group_indices = group.index.tolist()
+                    group_tfidf = X_tfidf[group_indices, :]
+                    group_tfidf = group_tfidf[column].tolist()
             
-                
-                # group_tfidf = X_tfidf[group_indices, :]
-                grouped_processed_df = self._create_similarity_matrix(group_X, group_indices, column, params['threshold'], similarity_method, blocking_value=group_name, progress_bar=False)
-                pdb.set_trace()
+                grouped_processed_df = self._create_similarity_matrix(group_tfidf, group_indices, column, params['threshold'], similarity_method, blocking_value=group_name, progress_bar=False)
                 if not grouped_processed_df.empty:
                     grouped_processed_df.rename(columns={
                         f"{column}_1_index": "idx1",
