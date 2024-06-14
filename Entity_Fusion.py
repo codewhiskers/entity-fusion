@@ -1,11 +1,11 @@
 import pandas as pd
 import numpy as np
 np.seterr(divide='ignore', invalid='ignore') # need to fix this later
-from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer, TfidfTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
 import multiprocessing as mp
-from sklearn.decomposition import TruncatedSVD
+# from sklearn.decomposition import TruncatedSVD
 import pdb
 from scipy.sparse import lil_matrix, coo_matrix
 import networkx as nx
@@ -14,20 +14,21 @@ import plotly.graph_objects as go
 from IPython.display import display
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 import re
-import random
+# import random
 from collections import deque, Counter, defaultdict
-from sparse_dot_topn import sp_matmul_topn
+from multiprocessing import Pool
 
 
 class Entity_Fusion:
-    
-    def __init__(self, df, column_thresholds, df2 = None, id_column=None, conditional='OR', pre_clustered_df=None):
+
+    def __init__(self, df, column_thresholds, df2=None, id_column=None, conditional='OR', pre_clustered_df=None):
         if df2 is not None:
-            self.df2 = df2.copy()
+            self.compare = True
             df['df'] = 1
             df2['df'] = 2
             df = pd.concat([df, df2], ignore_index=True)
         else:
+            self.compare = False
             df = df.copy()
         self.df = df.reset_index(drop=True)
         self.column_thresholds = column_thresholds
@@ -37,42 +38,34 @@ class Entity_Fusion:
         self.df_sim = None
         self.graph = None
         self.clusters = None
-        # self.tfidf_scores = None
         self.stopwords = set(ENGLISH_STOP_WORDS)
         if self.id_column not in self.df.columns:
             self.df[self.id_column] = range(1, len(self.df) + 1)
-
+        # self._create_blocking_columns()
 
     def _find_common_prefixes_and_postfixes(self, data, min_length=2):
         threshold = 5
         all_words = [word for text in data for word in text.split()]
         word_counts = Counter(all_words)
         common_affixes = [word for word, count in word_counts.items() if count >= threshold and len(word) >= min_length]
-        return common_affixes#common_prefixes, common_postfixes
+        return common_affixes
 
     def find_unclustered(self):
-        # Find the maximum existing cluster label
         max_label = int(self.df['cluster_label'].max() if self.df['cluster_label'].max() is not None else -1)
-        # Assign new unique labels to unclustered fields
         unclustered_mask = self.df['cluster_label'].isnull()
         num_unclustered = int(unclustered_mask.sum())
-        self.df.loc[unclustered_mask, 'cluster_label'] = range(max_label + 1, max_label + 1 + num_unclustered)  # Assign new labels
+        self.df.loc[unclustered_mask, 'cluster_label'] = range(max_label + 1, max_label + 1 + num_unclustered)
 
     def _create_exact_match_matrix(self, data, group_indices, column_name):
         matches = []
         value_to_indices = defaultdict(list)
-
-        # Build a dictionary where the keys are data values and the values are lists of indices
         for idx, value in enumerate(data):
             value_to_indices[value].append(group_indices[idx])
-
-        # Iterate over the dictionary to create matches
         for indices in tqdm(value_to_indices.values(), desc=f"Processing exact matches for {column_name}"):
             if len(indices) > 1:
                 for i in range(len(indices)):
                     for j in range(i + 1, len(indices)):
                         matches.append([indices[i], indices[j], 1])
-
         match_df = pd.DataFrame(
             matches,
             columns=[
@@ -86,8 +79,7 @@ class Entity_Fusion:
     def _create_similarity_matrix(self, group_tfidf, group_indices, column_name, threshold, similarity_method, blocking_value=None, progress_bar=True):
         if similarity_method == 'numeric_exact':
             return self._create_exact_match_matrix(group_tfidf, column_name)
-        
-        if group_tfidf.shape[0] > 5_000:  # Turn progress bar on since data is large
+        if group_tfidf.shape[0] > 5_000:
             progress_bar = True
 
         def compute_cosine_similarity_chunk(start_idx, end_idx, X_reduced, threshold):
@@ -128,7 +120,68 @@ class Entity_Fusion:
             ],
         )
         return sim_df
-    
+
+    def process_group(self, group_name, group, column, X_tfidf, similarity_method, threshold, blocking_value):
+        group = group[group[column].notnull()]
+        group = group[group[column] != '']
+        group = group[group[column] != 'nan']
+        group = group[group[column] != 'None']
+
+        group_indices = group.index.tolist()
+
+        if similarity_method == 'tfidf' or similarity_method == 'numeric':
+            group_tfidf = X_tfidf[group_indices, :]
+        elif similarity_method == 'numeric_exact':
+            group_tfidf = X_tfidf[group_indices, :]
+            group_tfidf = group_tfidf[column].tolist()
+
+        grouped_processed_df = self._create_similarity_matrix(group_tfidf, group_indices, column, threshold, similarity_method, blocking_value=group_name, progress_bar=False)
+
+        if not grouped_processed_df.empty:
+            grouped_processed_df.rename(columns={
+                f"{column}_1_index": "idx1",
+                f"{column}_2_index": "idx2",
+                f"{column}_similarity": f"{column}_similarity"
+            }, inplace=True)
+            grouped_processed_df = grouped_processed_df[['idx1', 'idx2', f"{column}_similarity"]]
+            return grouped_processed_df
+        else:
+            return pd.DataFrame(columns=['idx1', 'idx2', f"{column}_similarity"])
+
+    def merge_dataframes(self, left_df, right_df):
+        return pd.merge(
+            left_df,
+            right_df,
+            on=["idx1", "idx2"],
+            how="outer"
+        )
+
+    def group_dataframe(self, df, params, column):
+        blocking_criteria = params.get('blocking_criteria', None)
+
+        if blocking_criteria is not None:
+            grouped_data = [df]
+
+            for criterion in blocking_criteria:
+                new_groups = []
+                for group in grouped_data:
+                    if criterion == 'first_letter':
+                        new_groups.extend(list(group.groupby(group[column].str[0])))
+                    elif criterion == 'blocking_column':
+                        blocking_columns = params.get('blocking_column')
+                        if isinstance(blocking_columns, list):
+                            new_groups.extend(list(group.groupby([group[col] for col in blocking_columns])))
+                        else:
+                            new_groups.extend(list(group.groupby(group[blocking_columns])))
+                    else:
+                        raise ValueError(f"Unsupported criterion: {criterion}")
+
+                grouped_data = [grp for _, grp in new_groups if len(grp) > 1]
+
+            return [(group_name, group) for group_name, group in new_groups]
+        else:
+            return [(None, df)]
+
     def create_similarity_matrices(self):
         processed_dfs = []
         for column, params in self.column_thresholds.items():
@@ -146,76 +199,16 @@ class Entity_Fusion:
             elif similarity_method == 'numeric_exact':
                 X_tfidf = data
             
-            def group_dataframe(df, params, column):
-                blocking_criteria = params.get('blocking_criteria', None)
-                
-                if blocking_criteria is not None:
-                    grouped_data = [df]
-
-                    for criterion in blocking_criteria:
-                        new_groups = []
-                        for group in grouped_data:
-                            if criterion == 'first_letter':
-                                new_groups.extend(list(group.groupby(group[column].str[0])))
-                            elif criterion == 'blocking_column':
-                                blocking_columns = params.get('blocking_column')
-                                if isinstance(blocking_columns, list):
-                                    new_groups.extend(list(group.groupby([group[col] for col in blocking_columns])))
-                                else:
-                                    new_groups.extend(list(group.groupby(group[blocking_columns])))
-                            else:
-                                raise ValueError(f"Unsupported criterion: {criterion}")
-                        
-                        grouped_data = [grp for _, grp in new_groups if len(grp) > 1]  # group size must be greater than 1
-                    
-                    return [(group_name, group) for group_name, group in new_groups]
-                else:
-                    return [(None, df)]
-
-                
-            grouped_data = group_dataframe(df, params, column)
-            grouped_processed_dfs = pd.DataFrame(columns=['idx1', 'idx2', f"{column}_similarity"])
+            grouped_data = self.group_dataframe(df, params, column)
             
+            grouped_processed_dfs_list = []
             for group_name, group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
-                group = group[group[column].notnull()]
-                group = group[group[column] != '']
-                group = group[group[column] != 'nan']
-                group = group[group[column] != 'None']
-                
-                if similarity_method == 'tfidf':
-                    group_indices = group.index.tolist()
-                    group_tfidf = X_tfidf[group_indices, :]
-                elif similarity_method == 'numeric':
-                    group_indices = group.index.tolist()
-                    group_tfidf = X_tfidf[group_indices, :]
-                elif similarity_method == 'numeric_exact': 
-                    group_indices = group.index.tolist()
-                    group_tfidf = X_tfidf[group_indices, :]
-                    group_tfidf = group_tfidf[column].tolist()
+                result = self.process_group(group_name, group, column, X_tfidf, similarity_method, params['threshold'], group_name)
+                grouped_processed_dfs_list.append(result)
             
-                grouped_processed_df = self._create_similarity_matrix(group_tfidf, group_indices, column, params['threshold'], similarity_method, blocking_value=group_name, progress_bar=False)
-                if not grouped_processed_df.empty:
-                    grouped_processed_df.rename(columns={
-                        f"{column}_1_index": "idx1",
-                        f"{column}_2_index": "idx2",
-                        f"{column}_similarity": f"{column}_similarity"
-                    }, inplace=True)
-                    grouped_processed_df = grouped_processed_df[['idx1', 'idx2', f"{column}_similarity"]]
-                    grouped_processed_dfs = pd.concat([grouped_processed_dfs, grouped_processed_df], ignore_index=True)
-                else:
-                    continue
-
+            grouped_processed_dfs = pd.concat(grouped_processed_dfs_list, ignore_index=True)
+            
             processed_dfs.append(grouped_processed_dfs)
-        
-        # Incremental merge with debugging
-        def merge_dataframes(left_df, right_df):
-            # print(f"Merging dataframes: {left_df.shape} with {right_df.shape}")
-            return pd.merge(
-                left_df,
-                right_df,
-                on=["idx1", "idx2"],
-                how="outer"
-            )
         
         if not processed_dfs:
             raise ValueError("No processed DataFrames to merge.")
@@ -223,56 +216,107 @@ class Entity_Fusion:
         # Initialize merged DataFrame
         df_sim = processed_dfs[0]
         for i in range(1, len(processed_dfs)):
-            df_sim = merge_dataframes(df_sim, processed_dfs[i])
-            # print(f"Merged DataFrame {i}: {df_sim.shape}")
+            df_sim = self.merge_dataframes(df_sim, processed_dfs[i])
+        
         df_sim = df_sim.fillna(0)
         self.df_sim = df_sim
         return df_sim
+
+    # def _create_blocking_columns(self):
+    #     for column, params in self.column_thresholds.items():
+    #         blocking_criteria = params.get('blocking_criteria', None)
+    #         if blocking_criteria:
+    #             blocking_values = []
+    #             for criterion in blocking_criteria:
+    #                 if criterion == 'first_letter':
+    #                     blocking_values.append(self.df[column].str[0].fillna(''))
+    #                 elif criterion == 'blocking_column':
+    #                     blocking_columns = params.get('blocking_column')
+    #                     if isinstance(blocking_columns, list):
+    #                         blocking_values.append(self.df[blocking_columns].astype(str).agg('_'.join, axis=1))
+    #                     else:
+    #                         blocking_values.append(self.df[blocking_columns].astype(str))
+    #                 else:
+    #                     raise ValueError(f"Unsupported criterion: {criterion}")
+    #             self.df[f"{column}_blocking_combined"] = pd.concat(blocking_values, axis=1).astype(str).agg('_'.join, axis=1)
+    #     # pdb.set_trace()
+
+    # def create_similarity_matrices(self):
+    #     processed_dfs = []
+    #     for column, params in self.column_thresholds.items():
+    #         df = self.df.copy()
+    #         df[column] = df[column].astype(str)
+    #         similarity_method = params.get('similarity_method', 'tfidf')
+    #         threshold = params['threshold']
+
+    #         data = df[column].tolist()
+    #         if similarity_method == 'numeric':
+    #             vectorizer = TfidfVectorizer(tokenizer=lambda x: re.findall(r'\d+', x), preprocessor=None, lowercase=False, stop_words='english')
+    #             X_tfidf = vectorizer.fit_transform(data)
+    #         elif similarity_method == 'tfidf':
+    #             vectorizer = TfidfVectorizer(preprocessor=None, lowercase=False, ngram_range=(2, 3), norm='l2', smooth_idf=True, use_idf=True, stop_words='english')
+    #             X_tfidf = vectorizer.fit_transform(data)
+    #         elif similarity_method == 'numeric_exact':
+    #             X_tfidf = data
+
+    #         blocking_column_name = f"{column}_blocking_combined"
+    #         unique_blocks = df[blocking_column_name].unique()
+
+    #         for block in tqdm(unique_blocks):
+    #             block_df = df[df[blocking_column_name] == block]
+    #             group_indices = block_df.index.tolist()
+    #             X_block = X_tfidf[group_indices, :]
+    #             grouped_processed_df = self._create_similarity_matrix(X_block, group_indices, column, threshold, similarity_method)
+    #             if not grouped_processed_df.empty:
+    #                 grouped_processed_df.rename(columns={
+    #                     f"{column}_1_index": "idx1",
+    #                     f"{column}_2_index": "idx2",
+    #                     f"{column}_similarity": f"{column}_similarity"
+    #                 }, inplace=True)
+    #                 grouped_processed_df = grouped_processed_df[['idx1', 'idx2', f"{column}_similarity"]]
+    #                 processed_dfs.append(grouped_processed_df)
+
+    #     if not processed_dfs:
+    #         raise ValueError("No processed DataFrames to merge.")
+
+    #     df_sim = pd.concat(processed_dfs, ignore_index=True)
+    #     df_sim = df_sim.fillna(0)
+    #     self.df_sim = df_sim
+    #     return df_sim
 
     def _construct_similarity_graph(self):
         print('Computing similarity graph...')
         self.graph = defaultdict(set)
 
-        # Create boolean masks for the conditions
         masks = []
         for col, params in self.column_thresholds.items():
-            # print(f"Processing column: {col}")
             masks.append(self.df_sim[f"{col}_similarity"] >= params['threshold'])
-        
+
         if self.conditional == 'AND':
             final_mask = np.logical_and.reduce(masks)
-        else:  # self.conditional == 'OR'
+        else:
             final_mask = np.logical_or.reduce(masks)
 
-        # print(f"Final mask: {final_mask}")
-
-        # Use the final mask to filter the DataFrame
         filtered_df = self.df_sim[final_mask]
-        # print(f"Filtered DataFrame: {filtered_df.shape}")
 
-        # Convert pre-clustered DataFrame to sets for quick lookup
         if self.pre_clustered_df is not None:
             exclude_set = set(zip(self.pre_clustered_df[self.pre_clustered_df['match'] == False]['id1'],
-                                self.pre_clustered_df[self.pre_clustered_df['match'] == False]['id2']))
-            reverse_exclude_set = set((y, x) for x, y in exclude_set)  # Create reverse pairs
+                                  self.pre_clustered_df[self.pre_clustered_df['match'] == False]['id2']))
+            reverse_exclude_set = set((y, x) for x, y in exclude_set)
             exclude_set.update(reverse_exclude_set)
-            # print(f"Exclude set: {exclude_set}")
-            
+
             include_set = set(zip(self.pre_clustered_df[self.pre_clustered_df['match'] == True]['id1'],
-                                self.pre_clustered_df[self.pre_clustered_df['match'] == True]['id2']))
-            reverse_include_set = set((y, x) for x, y in include_set)  # Create reverse pairs
+                                  self.pre_clustered_df[self.pre_clustered_df['match'] == True]['id2']))
+            reverse_include_set = set((y, x) for x, y in include_set)
             include_set.update(reverse_include_set)
-            # print(f"Include set: {include_set}")
         else:
             exclude_set = set()
             include_set = set()
 
-        # Extract edges using vectorized operations
         idx1 = filtered_df["idx1"].astype(int)
         idx2 = filtered_df["idx2"].astype(int)
         edges = list(zip(idx1, idx2))
 
-        # Add edges to the graph with a progress bar
         for edge in tqdm(edges, desc="Adding edges to the graph"):
             if edge[0] is None or edge[1] is None:
                 print(f"Invalid edge found: {edge}")
@@ -283,8 +327,7 @@ class Entity_Fusion:
             if (id1, id2) not in exclude_set:
                 self.graph[edge[0]].add(edge[1])
                 self.graph[edge[1]].add(edge[0])
-        
-        # Add edges from the include set
+
         for id1, id2 in include_set:
             node1 = self.df[self.df[self.id_column].astype(str) == str(id1)].index[0]
             node2 = self.df[self.df[self.id_column].astype(str) == str(id2)].index[0]
@@ -329,7 +372,7 @@ class Entity_Fusion:
         self.clusters = self._find_clusters_from_graph(self.graph)
         self.df["cluster_label"] = self.df.index.map(self.clusters)
         self.find_unclustered()
-        if self.df2 is not None:
+        if self.compare == True:
             matched = self.df.groupby('cluster_label')['df'].nunique().reset_index()
             matched = matched.rename(columns={'df': 'matched'})
             matched['matched'] = np.where(matched['matched'] == 2, True, False)
