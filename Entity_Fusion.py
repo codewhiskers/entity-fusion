@@ -78,7 +78,7 @@ class Entity_Fusion:
 
     def _create_similarity_matrix(self, group_tfidf, group_indices, column_name, threshold, similarity_method, blocking_value=None, progress_bar=True):
         if similarity_method == 'numeric_exact':
-            return self._create_exact_match_matrix(group_tfidf, column_name)
+            return self._create_exact_match_matrix(group_tfidf, group_indices, column_name)
         if group_tfidf.shape[0] > 5_000:
             progress_bar = True
 
@@ -123,6 +123,7 @@ class Entity_Fusion:
 
     def process_group(self, group_name, group, column, X_tfidf, similarity_method, threshold, blocking_value):
         group = group[group[column].notnull()]
+        group = group[group[column].str.contains(r'\d')]
         group = group[group[column] != '']
         group = group[group[column] != 'nan']
         group = group[group[column] != 'None']
@@ -132,7 +133,7 @@ class Entity_Fusion:
         if similarity_method == 'tfidf' or similarity_method == 'numeric':
             group_tfidf = X_tfidf[group_indices, :]
         elif similarity_method == 'numeric_exact':
-            group_tfidf = X_tfidf[group_indices, :]
+            group_tfidf = X_tfidf.loc[group_indices, :]
             group_tfidf = group_tfidf[column].tolist()
 
         grouped_processed_df = self._create_similarity_matrix(group_tfidf, group_indices, column, threshold, similarity_method, blocking_value=group_name, progress_bar=False)
@@ -197,11 +198,12 @@ class Entity_Fusion:
                 vectorizer = TfidfVectorizer(preprocessor=None, lowercase=False, ngram_range=(2, 3), norm='l2', smooth_idf=True, use_idf=True, stop_words='english')
                 X_tfidf = vectorizer.fit_transform(data)
             elif similarity_method == 'numeric_exact':
-                X_tfidf = data
+                X_tfidf = df
             
             grouped_data = self.group_dataframe(df, params, column)
             
             grouped_processed_dfs_list = []
+            
             for group_name, group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
                 result = self.process_group(group_name, group, column, X_tfidf, similarity_method, params['threshold'], group_name)
                 grouped_processed_dfs_list.append(result)
