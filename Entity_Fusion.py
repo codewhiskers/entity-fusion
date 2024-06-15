@@ -16,7 +16,7 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 import re
 # import random
 from collections import deque, Counter, defaultdict
-from multiprocessing import Pool
+from multiprocessing import Pool, cpu_count, freeze_support
 
 
 class Entity_Fusion:
@@ -41,7 +41,6 @@ class Entity_Fusion:
         self.stopwords = set(ENGLISH_STOP_WORDS)
         if self.id_column not in self.df.columns:
             self.df[self.id_column] = range(1, len(self.df) + 1)
-        # self._create_blocking_columns()
 
     def _find_common_prefixes_and_postfixes(self, data, min_length=2):
         threshold = 5
@@ -82,8 +81,8 @@ class Entity_Fusion:
         if group_tfidf.shape[0] > 5_000:
             progress_bar = True
 
-        def compute_cosine_similarity_chunk(start_idx, end_idx, X_reduced, threshold):
-            chunk_matrix = cosine_similarity(X_reduced[start_idx:end_idx], X_reduced)
+        def compute_cosine_similarity_chunk(start_idx, end_idx, group_tfidf, threshold):
+            chunk_matrix = cosine_similarity(group_tfidf[start_idx:end_idx], group_tfidf)
             mask = chunk_matrix >= threshold
             chunk_matrix = np.where(mask, chunk_matrix, 0)
             return start_idx, end_idx, chunk_matrix
@@ -183,8 +182,13 @@ class Entity_Fusion:
         else:
             return [(None, df)]
 
-    def create_similarity_matrices(self):
+    def worker(self, args):
+        return self.process_group(*args)
+
+    def create_similarity_matrices(self, multiprocessing):
         processed_dfs = []
+        pool = Pool(processes=cpu_count())
+        
         for column, params in self.column_thresholds.items():
             df = self.df.copy()
             df[column] = df[column].astype(str)
@@ -199,14 +203,24 @@ class Entity_Fusion:
                 X_tfidf = vectorizer.fit_transform(data)
             elif similarity_method == 'numeric_exact':
                 X_tfidf = df
-            
             grouped_data = self.group_dataframe(df, params, column)
             
-            grouped_processed_dfs_list = []
-            
-            for group_name, group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
-                result = self.process_group(group_name, group, column, X_tfidf, similarity_method, params['threshold'], group_name)
-                grouped_processed_dfs_list.append(result)
+            if multiprocessing:
+                # tasks = [(group_name, group, column, X_tfidf, similarity_method, params['threshold'], group_name) for group_name, group in grouped_data]
+                # grouped_processed_dfs_list = pool.map(self.worker, tasks)
+                tasks = [(group_name, group, column, X_tfidf, similarity_method, params['threshold'], group_name) for group_name, group in grouped_data]
+                chunk_size = max(1, len(tasks) // (cpu_count() * 2))
+                with Pool(processes=cpu_count()) as pool:
+                    grouped_processed_dfs_list = []
+                    with tqdm(total=len(tasks), desc="Processing groups") as pbar:
+                        for result in pool.imap_unordered(self.worker, tasks, chunksize=chunk_size):
+                            grouped_processed_dfs_list.append(result)
+                            pbar.update()
+            else:
+                grouped_processed_dfs_list = []
+                for group_name, group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
+                    result = self.process_group(group_name, group, column, X_tfidf, similarity_method, params['threshold'], group_name)
+                    grouped_processed_dfs_list.append(result)
             
             grouped_processed_dfs = pd.concat(grouped_processed_dfs_list, ignore_index=True)
             
@@ -224,69 +238,22 @@ class Entity_Fusion:
         self.df_sim = df_sim
         return df_sim
 
-    # def _create_blocking_columns(self):
-    #     for column, params in self.column_thresholds.items():
-    #         blocking_criteria = params.get('blocking_criteria', None)
-    #         if blocking_criteria:
-    #             blocking_values = []
-    #             for criterion in blocking_criteria:
-    #                 if criterion == 'first_letter':
-    #                     blocking_values.append(self.df[column].str[0].fillna(''))
-    #                 elif criterion == 'blocking_column':
-    #                     blocking_columns = params.get('blocking_column')
-    #                     if isinstance(blocking_columns, list):
-    #                         blocking_values.append(self.df[blocking_columns].astype(str).agg('_'.join, axis=1))
-    #                     else:
-    #                         blocking_values.append(self.df[blocking_columns].astype(str))
-    #                 else:
-    #                     raise ValueError(f"Unsupported criterion: {criterion}")
-    #             self.df[f"{column}_blocking_combined"] = pd.concat(blocking_values, axis=1).astype(str).agg('_'.join, axis=1)
-    #     # pdb.set_trace()
 
-    # def create_similarity_matrices(self):
-    #     processed_dfs = []
-    #     for column, params in self.column_thresholds.items():
-    #         df = self.df.copy()
-    #         df[column] = df[column].astype(str)
-    #         similarity_method = params.get('similarity_method', 'tfidf')
-    #         threshold = params['threshold']
+    def add_edges_to_graph(self, args):
+        edge_chunk, exclude_set = args
+        local_graph = defaultdict(set)
+        for edge in edge_chunk:
+            if edge[0] is None or edge[1] is None:
+                print(f"Invalid edge found: {edge}")
+                continue
+            id1 = self.df.loc[edge[0], self.id_column]
+            id2 = self.df.loc[edge[1], self.id_column]
+            if (id1, id2) not in exclude_set:
+                local_graph[edge[0]].add(edge[1])
+                local_graph[edge[1]].add(edge[0])
+        return local_graph
 
-    #         data = df[column].tolist()
-    #         if similarity_method == 'numeric':
-    #             vectorizer = TfidfVectorizer(tokenizer=lambda x: re.findall(r'\d+', x), preprocessor=None, lowercase=False, stop_words='english')
-    #             X_tfidf = vectorizer.fit_transform(data)
-    #         elif similarity_method == 'tfidf':
-    #             vectorizer = TfidfVectorizer(preprocessor=None, lowercase=False, ngram_range=(2, 3), norm='l2', smooth_idf=True, use_idf=True, stop_words='english')
-    #             X_tfidf = vectorizer.fit_transform(data)
-    #         elif similarity_method == 'numeric_exact':
-    #             X_tfidf = data
-
-    #         blocking_column_name = f"{column}_blocking_combined"
-    #         unique_blocks = df[blocking_column_name].unique()
-
-    #         for block in tqdm(unique_blocks):
-    #             block_df = df[df[blocking_column_name] == block]
-    #             group_indices = block_df.index.tolist()
-    #             X_block = X_tfidf[group_indices, :]
-    #             grouped_processed_df = self._create_similarity_matrix(X_block, group_indices, column, threshold, similarity_method)
-    #             if not grouped_processed_df.empty:
-    #                 grouped_processed_df.rename(columns={
-    #                     f"{column}_1_index": "idx1",
-    #                     f"{column}_2_index": "idx2",
-    #                     f"{column}_similarity": f"{column}_similarity"
-    #                 }, inplace=True)
-    #                 grouped_processed_df = grouped_processed_df[['idx1', 'idx2', f"{column}_similarity"]]
-    #                 processed_dfs.append(grouped_processed_df)
-
-    #     if not processed_dfs:
-    #         raise ValueError("No processed DataFrames to merge.")
-
-    #     df_sim = pd.concat(processed_dfs, ignore_index=True)
-    #     df_sim = df_sim.fillna(0)
-    #     self.df_sim = df_sim
-    #     return df_sim
-
-    def _construct_similarity_graph(self):
+    def _construct_similarity_graph(self, multiprocessing=True):
         print('Computing similarity graph...')
         self.graph = defaultdict(set)
 
@@ -319,16 +286,30 @@ class Entity_Fusion:
         idx2 = filtered_df["idx2"].astype(int)
         edges = list(zip(idx1, idx2))
 
-        for edge in tqdm(edges, desc="Adding edges to the graph"):
-            if edge[0] is None or edge[1] is None:
-                print(f"Invalid edge found: {edge}")
-                continue
+        if multiprocessing:
+            chunk_size = max(1, len(edges) // (cpu_count() * 4))
+            # chunk_size = 1_000
+            # print(chunk_size)
+            with Pool(processes=cpu_count()) as pool:
+                results = []
+                with tqdm(total=len(edges), desc="Adding edges to the graph") as pbar:
+                    for local_graph in pool.imap_unordered(self.add_edges_to_graph, [(edges[i:i + chunk_size], exclude_set) for i in range(0, len(edges), chunk_size)], chunksize=chunk_size):
+                        results.append(local_graph)
+                        pbar.update(chunk_size)
 
-            id1 = self.df.loc[edge[0], self.id_column]
-            id2 = self.df.loc[edge[1], self.id_column]
-            if (id1, id2) not in exclude_set:
-                self.graph[edge[0]].add(edge[1])
-                self.graph[edge[1]].add(edge[0])
+            for local_graph in results:
+                for node, neighbors in local_graph.items():
+                    self.graph[node].update(neighbors)
+        else:
+            for edge in tqdm(edges, desc="Adding edges to the graph"):
+                if edge[0] is None or edge[1] is None:
+                    print(f"Invalid edge found: {edge}")
+                    continue
+                id1 = self.df.loc[edge[0], self.id_column]
+                id2 = self.df.loc[edge[1], self.id_column]
+                if (id1, id2) not in exclude_set:
+                    self.graph[edge[0]].add(edge[1])
+                    self.graph[edge[1]].add(edge[0])
 
         for id1, id2 in include_set:
             node1 = self.df[self.df[self.id_column].astype(str) == str(id1)].index[0]
@@ -368,9 +349,9 @@ class Entity_Fusion:
         return cluster_map
     
 
-    def cluster_data(self):
-        self.create_similarity_matrices()
-        self._construct_similarity_graph()
+    def cluster_data(self, multiprocessing=False):
+        self.create_similarity_matrices(multiprocessing)
+        self._construct_similarity_graph(multiprocessing)
         self.clusters = self._find_clusters_from_graph(self.graph)
         self.df["cluster_label"] = self.df.index.map(self.clusters)
         self.find_unclustered()
@@ -499,85 +480,3 @@ class Entity_Fusion:
                         )
         display(fig)
         
-        
-        
-    # def update_clusters_with_post_clustered(self, df_post_clustered):
-    #     # Define key columns (all except the last column which is assumed to be 'cluster_label')
-    #     key_columns = df_post_clustered.columns[:-1].tolist()
-        
-    #     # Create a dictionary mapping the key column values to the cluster_label
-    #     # Use tuples of key columns for creating the mapping
-    #     post_clustered_map = df_post_clustered.set_index(key_columns)['cluster_label'].to_dict()
-        
-    #     # Function to create a tuple of key column values for each row
-    #     def create_key_tuple(row):
-    #         return tuple(row[key_columns])
-        
-    #     # Apply the function to create a tuple key for each row in the original DataFrame
-    #     self.df['key_tuple'] = self.df.apply(create_key_tuple, axis=1)
-        
-    #     # Update the cluster labels in the original DataFrame based on the post-clustered DataFrame
-    #     self.df['cluster_label'] = self.df['key_tuple'].map(post_clustered_map).combine_first(self.df['cluster_label'])
-        
-    #     # Clean up the key tuple column
-    #     self.df.drop(columns=['key_tuple'], inplace=True)
-    
-    
-    
-    # def _custom_tokenizer(self, text):
-    #     words = self._split_string_with_spaces(text) 
-    #     total_words = len(words)
-        
-    #     # # Use a more gradual dropoff for shorter strings
-    #     # base = np.log(total_words + 1)
-        
-    #     # # Calculate initial weights using logarithm and base
-    #     # initial_weights = [1 / (np.log(i + 1) + base) ** 2 for i in range(1, total_words + 1)]
-        
-    #     # # Normalize weights so that the first weight is 1
-    #     # first_weight = initial_weights[0]
-    #     # word_weights = [weight / first_weight for weight in initial_weights]
-    #     word_weights = [1 for i in range(1, total_words + 1)]
-
-    #     weighted_tokens = []
-    #     for word, weight in zip(words, word_weights):
-    #         # Remove stopwords... 
-    #         # if word.lower().strip() in self.stopwords:
-    #         #     continue
-    #         # Reduce weight for common postfixes
-    #         if word.strip() in self.common_affixes:
-    #             if word == words[-1]:
-    #                 weight *= 0.5
-    #             if word == words[0]:
-    #                 weight *= 0.75
-                    
-    #         # Generate 2-word and 3-word tokens including spaces
-    #         if len(word) > 2:  # Ensure the word length is valid for bi-gram generation
-    #             tokens = [word[i:i+3] for i in range(len(word) - 2)]
-    #             for token in tokens:
-    #                 weighted_tokens.extend([token] * int(weight * 10))# * 100))  # Adjust weight scaling as needed
-    #     return weighted_tokens
-    
-        # def _split_string_with_spaces(self, input_string):
-        # """
-        # Split a string and add spaces before and after words that are in the middle.
-        
-        # Parameters:
-        # input_string (str): The input string to split.
-        
-        # Returns:
-        # list: A list of words with added spaces before and after for middle words.
-        # """
-        # # Split the string by spaces
-        # words = input_string.split()
-        
-        # # Process each word to add spaces
-        # result = []
-        # for i, word in enumerate(words):
-        #     if i == 0:
-        #         result.append(word + ' ')
-        #     elif i == len(words) - 1:
-        #         result.append(' ' + word)
-        #     else:
-        #         result.append(' ' + word + ' ')
-        # return result
