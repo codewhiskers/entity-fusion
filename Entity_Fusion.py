@@ -265,25 +265,26 @@ class Entity_Fusion:
         return df_sim
 
 
-    def add_edges_to_graph(self, args):
-        edge_chunk, exclude_set = args
-        local_graph = defaultdict(set)
-        for edge in edge_chunk:
-            if edge[0] is None or edge[1] is None:
-                print(f"Invalid edge found: {edge}")
-                continue
-            id1 = self.df.loc[edge[0], self.id_column]
-            id2 = self.df.loc[edge[1], self.id_column]
-            if (id1, id2) not in exclude_set:
-                local_graph[edge[0]].add(edge[1])
-                local_graph[edge[1]].add(edge[0])
-        return local_graph
+    # def add_edges_to_graph(self, args):
+    #     edge_chunk, exclude_set = args
+    #     local_graph = defaultdict(set)
+    #     for edge in edge_chunk:
+    #         if edge[0] is None or edge[1] is None:
+    #             print(f"Invalid edge found: {edge}")
+    #             continue
+    #         id1 = self.df.loc[edge[0], self.id_column]
+    #         id2 = self.df.loc[edge[1], self.id_column]
+    #         if (id1, id2) not in exclude_set:
+    #             local_graph[edge[0]].add(edge[1])
+    #             local_graph[edge[1]].add(edge[0])
+    #     return local_graph
 
-    def _construct_similarity_graph(self):
+    def _construct_similarity_graph(self, multiprocessing=True):
         print('Computing similarity graph...')
         
         if self.graph is None:
             self.graph = defaultdict(set)
+
         masks = []
         for col, params in self.column_thresholds.items():
             masks.append(self.df_sim[f"{col}_similarity"] >= params['threshold'])
@@ -297,29 +298,32 @@ class Entity_Fusion:
 
         if self.pre_clustered_df is not None:
             exclude_set = set(zip(self.pre_clustered_df[self.pre_clustered_df['match'] == False]['id1'],
-                                  self.pre_clustered_df[self.pre_clustered_df['match'] == False]['id2']))
+                                self.pre_clustered_df[self.pre_clustered_df['match'] == False]['id2']))
             reverse_exclude_set = set((y, x) for x, y in exclude_set)
             exclude_set.update(reverse_exclude_set)
 
             include_set = set(zip(self.pre_clustered_df[self.pre_clustered_df['match'] == True]['id1'],
-                                  self.pre_clustered_df[self.pre_clustered_df['match'] == True]['id2']))
+                                self.pre_clustered_df[self.pre_clustered_df['match'] == True]['id2']))
             reverse_include_set = set((y, x) for x, y in include_set)
             include_set.update(reverse_include_set)
         else:
             exclude_set = set()
             include_set = set()
 
-        idx1 = filtered_df["idx1"].astype(int)
-        idx2 = filtered_df["idx2"].astype(int)
+        idx1 = filtered_df["idx1"].astype(int).values
+        idx2 = filtered_df["idx2"].astype(int).values
         edges = list(zip(idx1, idx2))
+
+        # Create a hash map (dictionary) for fast ID lookup
+        id_map = self.df[self.id_column].to_dict()
 
         for edge in tqdm(edges, desc="Adding edges to the graph"):
             if edge[0] is None or edge[1] is None:
                 print(f"Invalid edge found: {edge}")
                 continue
-            id1 = self.df.loc[edge[0], self.id_column]
-            id2 = self.df.loc[edge[1], self.id_column]
-            if (id1, id2) not in exclude_set:
+            id1 = id_map.get(edge[0])
+            id2 = id_map.get(edge[1])
+            if id1 is not None and id2 is not None and (id1, id2) not in exclude_set and (id2, id1) not in exclude_set:
                 self.graph[edge[0]].add(edge[1])
                 self.graph[edge[1]].add(edge[0])
 
