@@ -16,21 +16,42 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 import re
 # import random
 from collections import deque, Counter, defaultdict
-from multiprocessing import Pool, cpu_count, freeze_support
+from multiprocessing import Pool, cpu_count
+import pickle
+import os
 
 
 class Entity_Fusion:
-
-    def __init__(self, df, column_thresholds, df2=None, id_column=None, conditional='OR', pre_clustered_df=None):
+    def __init__(self, 
+                 df, 
+                 id_column,
+                 column_thresholds, 
+                 df2=None, 
+                 conditional='OR', 
+                 pre_clustered_df=None, 
+                 clustered_csv_path='clustered_data.csv', 
+                 graph_path='graph.pkl'):
+        # Ensure ID column is specified and unique
+        if id_column not in df.columns:
+            raise ValueError(f"The ID column '{id_column}' is not present in the dataframe.")
+        
         if df2 is not None:
             self.compare = True
             df['df'] = 1
             df2['df'] = 2
+            if id_column not in df2.columns:
+                raise ValueError(f"The ID column '{id_column}' is not present in the second dataframe.")
+            
             df = pd.concat([df, df2], ignore_index=True)
         else:
             self.compare = False
             df = df.copy()
-        self.df = df.reset_index(drop=True)
+            
+         # Check for unique IDs in the first dataframe
+        if not df[id_column].is_unique:
+            duplicated_ids = df[id_column][df[id_column].duplicated()].unique()
+            raise ValueError(f"The ID column '{id_column}' must contain unique values. Duplicated IDs: {duplicated_ids}")
+        
         self.column_thresholds = column_thresholds
         self.id_column = id_column if id_column else 'id'
         self.conditional = conditional
@@ -38,9 +59,25 @@ class Entity_Fusion:
         self.df_sim = None
         self.graph = None
         self.clusters = None
+        self.clustered_csv_path = clustered_csv_path
+        self.graph_path = graph_path
         self.stopwords = set(ENGLISH_STOP_WORDS)
-        if self.id_column not in self.df.columns:
-            self.df[self.id_column] = range(1, len(self.df) + 1)
+        
+        # Load existing clustered data and graph if they exist
+        if os.path.exists(self.clustered_csv_path):
+            existing_data = pd.read_csv(self.clustered_csv_path)
+            with open(self.graph_path, 'rb') as file:
+                self.graph = pickle.load(file)
+            
+            # Verify that IDs do not conflict
+            conflicting_ids = set(df[self.id_column]).intersection(set(existing_data[self.id_column]))
+            if conflicting_ids:
+                raise ValueError(f"ID conflict detected between new data and existing clustered data. Conflicting IDs: {conflicting_ids}")
+            
+            self.df = pd.concat([existing_data, df], ignore_index=True)
+        else:
+            self.df = df.reset_index(drop=True)
+                
 
     def _find_common_prefixes_and_postfixes(self, data, min_length=2):
         threshold = 5
@@ -185,7 +222,7 @@ class Entity_Fusion:
     def worker(self, args):
         return self.process_group(*args)
 
-    def create_similarity_matrices(self, multiprocessing):
+    def create_similarity_matrices(self, multiprocessing=False):
         processed_dfs = []
         pool = Pool(processes=cpu_count())
         
@@ -236,6 +273,7 @@ class Entity_Fusion:
         
         df_sim = df_sim.fillna(0)
         self.df_sim = df_sim
+        # pdb.set_trace()
         return df_sim
 
 
@@ -253,10 +291,11 @@ class Entity_Fusion:
                 local_graph[edge[1]].add(edge[0])
         return local_graph
 
-    def _construct_similarity_graph(self, multiprocessing=True):
+    def _construct_similarity_graph(self, multiprocessing=False):
         print('Computing similarity graph...')
-        self.graph = defaultdict(set)
-
+        
+        if self.graph is None:
+            self.graph = defaultdict(set)
         masks = []
         for col, params in self.column_thresholds.items():
             masks.append(self.df_sim[f"{col}_similarity"] >= params['threshold'])
@@ -288,8 +327,6 @@ class Entity_Fusion:
 
         if multiprocessing:
             chunk_size = max(1, len(edges) // (cpu_count() * 4))
-            # chunk_size = 1_000
-            # print(chunk_size)
             with Pool(processes=cpu_count()) as pool:
                 results = []
                 with tqdm(total=len(edges), desc="Adding edges to the graph") as pbar:
@@ -355,12 +392,19 @@ class Entity_Fusion:
         self.clusters = self._find_clusters_from_graph(self.graph)
         self.df["cluster_label"] = self.df.index.map(self.clusters)
         self.find_unclustered()
-        if self.compare == True:
+        if self.compare:
             matched = self.df.groupby('cluster_label')['df'].nunique().reset_index()
             matched = matched.rename(columns={'df': 'matched'})
             matched['matched'] = np.where(matched['matched'] == 2, True, False)
             self.df = self.df.merge(matched, on='cluster_label', how='left')
+
+        # Save the graph and clusters to storage
+        self.df.to_csv(self.clustered_csv_path, index=False)
+        with open(self.graph_path, 'wb') as file:
+            pickle.dump(self.graph, file)
         return self.df
+
+
     
     def return_cluster_data_logic_dataframe(self):
         print('Creating cluster data logic DataFrame...')
