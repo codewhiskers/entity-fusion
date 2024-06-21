@@ -4,7 +4,6 @@ np.seterr(divide='ignore', invalid='ignore') # need to fix this later
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
-import multiprocessing as mp
 # from sklearn.decomposition import TruncatedSVD
 import pdb
 from scipy.sparse import lil_matrix, coo_matrix
@@ -16,7 +15,6 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 import re
 # import random
 from collections import deque, Counter, defaultdict
-from multiprocessing import Pool, cpu_count
 import pickle
 import os
 import datetime
@@ -226,9 +224,8 @@ class Entity_Fusion:
     def worker(self, args):
         return self.process_group(*args)
 
-    def create_similarity_matrices(self, multiprocessing=False):
+    def create_similarity_matrices(self):
         processed_dfs = []
-        pool = Pool(processes=cpu_count())
         
         for column, params in self.column_thresholds.items():
             df = self.df.copy()
@@ -246,22 +243,10 @@ class Entity_Fusion:
                 X_tfidf = df
             grouped_data = self.group_dataframe(df, params, column)
             
-            if multiprocessing:
-                # tasks = [(group_name, group, column, X_tfidf, similarity_method, params['threshold'], group_name) for group_name, group in grouped_data]
-                # grouped_processed_dfs_list = pool.map(self.worker, tasks)
-                tasks = [(group_name, group, column, X_tfidf, similarity_method, params['threshold'], group_name) for group_name, group in grouped_data]
-                chunk_size = max(1, len(tasks) // (cpu_count() * 2))
-                with Pool(processes=cpu_count()) as pool:
-                    grouped_processed_dfs_list = []
-                    with tqdm(total=len(tasks), desc="Processing groups") as pbar:
-                        for result in pool.imap_unordered(self.worker, tasks, chunksize=chunk_size):
-                            grouped_processed_dfs_list.append(result)
-                            pbar.update()
-            else:
-                grouped_processed_dfs_list = []
-                for group_name, group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
-                    result = self.process_group(group_name, group, column, X_tfidf, similarity_method, params['threshold'], group_name)
-                    grouped_processed_dfs_list.append(result)
+            grouped_processed_dfs_list = []
+            for group_name, group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
+                result = self.process_group(group_name, group, column, X_tfidf, similarity_method, params['threshold'], group_name)
+                grouped_processed_dfs_list.append(result)
             
             grouped_processed_dfs = pd.concat(grouped_processed_dfs_list, ignore_index=True)
             
@@ -277,7 +262,6 @@ class Entity_Fusion:
         
         df_sim = df_sim.fillna(0)
         self.df_sim = df_sim
-        # pdb.set_trace()
         return df_sim
 
 
@@ -295,7 +279,7 @@ class Entity_Fusion:
                 local_graph[edge[1]].add(edge[0])
         return local_graph
 
-    def _construct_similarity_graph(self, multiprocessing=False):
+    def _construct_similarity_graph(self):
         print('Computing similarity graph...')
         
         if self.graph is None:
@@ -329,28 +313,15 @@ class Entity_Fusion:
         idx2 = filtered_df["idx2"].astype(int)
         edges = list(zip(idx1, idx2))
 
-        if multiprocessing:
-            chunk_size = max(1, len(edges) // (cpu_count() * 4))
-            with Pool(processes=cpu_count()) as pool:
-                results = []
-                with tqdm(total=len(edges), desc="Adding edges to the graph") as pbar:
-                    for local_graph in pool.imap_unordered(self.add_edges_to_graph, [(edges[i:i + chunk_size], exclude_set) for i in range(0, len(edges), chunk_size)], chunksize=chunk_size):
-                        results.append(local_graph)
-                        pbar.update(chunk_size)
-
-            for local_graph in results:
-                for node, neighbors in local_graph.items():
-                    self.graph[node].update(neighbors)
-        else:
-            for edge in tqdm(edges, desc="Adding edges to the graph"):
-                if edge[0] is None or edge[1] is None:
-                    print(f"Invalid edge found: {edge}")
-                    continue
-                id1 = self.df.loc[edge[0], self.id_column]
-                id2 = self.df.loc[edge[1], self.id_column]
-                if (id1, id2) not in exclude_set:
-                    self.graph[edge[0]].add(edge[1])
-                    self.graph[edge[1]].add(edge[0])
+        for edge in tqdm(edges, desc="Adding edges to the graph"):
+            if edge[0] is None or edge[1] is None:
+                print(f"Invalid edge found: {edge}")
+                continue
+            id1 = self.df.loc[edge[0], self.id_column]
+            id2 = self.df.loc[edge[1], self.id_column]
+            if (id1, id2) not in exclude_set:
+                self.graph[edge[0]].add(edge[1])
+                self.graph[edge[1]].add(edge[0])
 
         for id1, id2 in include_set:
             node1 = self.df[self.df[self.id_column].astype(str) == str(id1)].index[0]
@@ -390,9 +361,9 @@ class Entity_Fusion:
         return cluster_map
     
 
-    def cluster_data(self, multiprocessing=False):
-        self.create_similarity_matrices(multiprocessing)
-        self._construct_similarity_graph(multiprocessing)
+    def cluster_data(self):
+        self.create_similarity_matrices()
+        self._construct_similarity_graph()
         self.clusters = self._find_clusters_from_graph(self.graph)
         self.df["cluster_label"] = self.df.index.map(self.clusters)
         self.find_unclustered()
