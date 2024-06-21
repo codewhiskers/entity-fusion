@@ -29,7 +29,7 @@ import pandas as pd
 # })
 
 # df = pd.read_pickle("cordata8_0.pkl")
-# df1 = df[0:10_000].copy()
+# df1 = df[0:5_000].copy()
 # # df2 = df[80_000:120_000].copy()
 
 # # pdb.set_trace()
@@ -82,7 +82,9 @@ import pandas as pd
 
 # if __name__ == '__main__':
 df = pd.read_pickle("cordata8_0.pkl")
-df1 = df[0:100_000].copy()
+# pdb.set_trace()
+df1 = df[5_000:10_000]
+# df2 = df[10_000:15_000]
 # df2 = df[80_000:120_000].copy()
 
 # pdb.set_trace()
@@ -92,6 +94,7 @@ def subset_and_clean_data(df):
     df["city"] = df["city"].str.upper()
     df["state"] = df["state"].str.upper()
     # df = CompanyCleaner(df, "corporation_name").clean_entity_names()
+    df.reset_index(inplace=True)
     return df
 # df = df[["corporation_name", "address_1", "city", "state", "fei_number", 'registered_agent_name']]
 
@@ -100,11 +103,12 @@ def subset_and_clean_data(df):
 # df["state"] = df["state"].str.upper()
 # df = CompanyCleaner(df, "corporation_name").clean_entity_names()
 df1 = subset_and_clean_data(df1)
+# df2 = subset_and_clean_data(df2)
 from Entity_Fusion import Entity_Fusion
 
 EF = Entity_Fusion(
-    df1,
-    {
+    df1, id_column='index',
+    column_thresholds={
         "corporation_name": {
             "threshold": 0.5,
             "blocking_column": ["city", 'state'],
@@ -123,11 +127,13 @@ EF = Entity_Fusion(
             "similarity_method": "numeric_exact",
         },
     }, 
+    # df2=df2
     # pre_clustered_df=pre_clustered_df
 )
+df1 = EF.cluster_data()
 # pdb.set_trace()
-
-df = EF.create_similarity_matrices()
+pdb.set_trace()
+# df = EF.create_similarity_matrices()
 # df_sim = EF.return_cluster_data_logic_dataframe()
 
 
