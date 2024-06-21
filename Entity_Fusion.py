@@ -6,6 +6,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
 # from sklearn.decomposition import TruncatedSVD
 import pdb
+from sparse_dot_topn import sp_matmul_topn
 from scipy.sparse import lil_matrix, coo_matrix
 import networkx as nx
 import plotly.graph_objects as go
@@ -114,40 +115,38 @@ class Entity_Fusion:
         )
         return match_df
 
+
+
     def _create_similarity_matrix(self, group_tfidf, group_indices, column_name, threshold, similarity_method, blocking_value=None, progress_bar=True):
         if similarity_method == 'numeric_exact':
             return self._create_exact_match_matrix(group_tfidf, group_indices, column_name)
+
+        # Determine the top_n based on the threshold
+        top_n = 10  # Adjust this based on your requirement or make it a parameter
+
         if group_tfidf.shape[0] > 5_000:
             progress_bar = True
 
-        def compute_cosine_similarity_chunk(start_idx, end_idx, group_tfidf, threshold):
-            chunk_matrix = cosine_similarity(group_tfidf[start_idx:end_idx], group_tfidf)
-            mask = chunk_matrix >= threshold
-            chunk_matrix = np.where(mask, chunk_matrix, 0)
-            return start_idx, end_idx, chunk_matrix
+        # Use multiple threads to compute top-N cosine similarities
+        n_threads = 4  # Adjust this based on your machine's capability
+        cos_sim_sparse = sp_matmul_topn(group_tfidf, group_tfidf.T, top_n=top_n, threshold=threshold, n_threads=n_threads)
 
-        chunk_size = 2_000
-        n_samples = group_tfidf.shape[0]
-        cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
-        if blocking_value:
-            cos_sim_desc = f"Computing cosine similarity in chunks for {column_name} (Blocking: {blocking_value})"
-        else:
-            cos_sim_desc = f"Computing cosine similarity in chunks for {column_name}"
-        loop_range = tqdm(range(0, n_samples, chunk_size), desc=cos_sim_desc, leave=False) if progress_bar else range(0, n_samples, chunk_size)
-
-        for start_idx in loop_range:
-            end_idx = min(start_idx + chunk_size, n_samples)
-            start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, group_tfidf, threshold)
-            cos_sim_sparse[start_idx:end_idx] = chunk_matrix
-
-        cos_sim_sparse = cos_sim_sparse.tocsr()
-        coo = coo_matrix(cos_sim_sparse)
+        coo = cos_sim_sparse.tocoo()
         rows, cols, values = coo.row, coo.col, coo.data
 
-        all_similarities = []
-        for i, j, value in zip(rows, cols, values):
-            if i != j:
-                all_similarities.append([group_indices[i], group_indices[j], value])
+        group_indices = np.array(group_indices)  # Convert to NumPy array for faster indexing
+
+        # Vectorized operation to filter out self-similarities
+        mask = rows != cols
+        filtered_rows = rows[mask]
+        filtered_cols = cols[mask]
+        filtered_values = values[mask]
+
+        all_similarities = np.vstack((
+            group_indices[filtered_rows],
+            group_indices[filtered_cols],
+            filtered_values
+        )).T
 
         sim_df = pd.DataFrame(
             all_similarities,
@@ -221,9 +220,6 @@ class Entity_Fusion:
         else:
             return [(None, df)]
 
-    def worker(self, args):
-        return self.process_group(*args)
-
     def create_similarity_matrices(self):
         processed_dfs = []
         
@@ -259,25 +255,12 @@ class Entity_Fusion:
         df_sim = processed_dfs[0]
         for i in range(1, len(processed_dfs)):
             df_sim = self.merge_dataframes(df_sim, processed_dfs[i])
-        
+        pdb.set_trace()
         df_sim = df_sim.fillna(0)
         self.df_sim = df_sim
+        
         return df_sim
 
-
-    # def add_edges_to_graph(self, args):
-    #     edge_chunk, exclude_set = args
-    #     local_graph = defaultdict(set)
-    #     for edge in edge_chunk:
-    #         if edge[0] is None or edge[1] is None:
-    #             print(f"Invalid edge found: {edge}")
-    #             continue
-    #         id1 = self.df.loc[edge[0], self.id_column]
-    #         id2 = self.df.loc[edge[1], self.id_column]
-    #         if (id1, id2) not in exclude_set:
-    #             local_graph[edge[0]].add(edge[1])
-    #             local_graph[edge[1]].add(edge[0])
-    #     return local_graph
 
     def _construct_similarity_graph(self, multiprocessing=True):
         print('Computing similarity graph...')
@@ -511,3 +494,47 @@ class Entity_Fusion:
                         )
         display(fig)
         
+    # def _create_similarity_matrix(self, group_tfidf, group_indices, column_name, threshold, similarity_method, blocking_value=None, progress_bar=True):
+    #     if similarity_method == 'numeric_exact':
+    #         return self._create_exact_match_matrix(group_tfidf, group_indices, column_name)
+    #     if group_tfidf.shape[0] > 5_000:
+    #         progress_bar = True
+
+    #     def compute_cosine_similarity_chunk(start_idx, end_idx, group_tfidf, threshold):
+    #         chunk_matrix = cosine_similarity(group_tfidf[start_idx:end_idx], group_tfidf)
+    #         mask = chunk_matrix >= threshold
+    #         chunk_matrix = np.where(mask, chunk_matrix, 0)
+    #         return start_idx, end_idx, chunk_matrix
+
+    #     chunk_size = 2_000
+    #     n_samples = group_tfidf.shape[0]
+    #     cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
+    #     if blocking_value:
+    #         cos_sim_desc = f"Computing cosine similarity in chunks for {column_name} (Blocking: {blocking_value})"
+    #     else:
+    #         cos_sim_desc = f"Computing cosine similarity in chunks for {column_name}"
+    #     loop_range = tqdm(range(0, n_samples, chunk_size), desc=cos_sim_desc, leave=False) if progress_bar else range(0, n_samples, chunk_size)
+
+    #     for start_idx in loop_range:
+    #         end_idx = min(start_idx + chunk_size, n_samples)
+    #         start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(start_idx, end_idx, group_tfidf, threshold)
+    #         cos_sim_sparse[start_idx:end_idx] = chunk_matrix
+
+    #     cos_sim_sparse = cos_sim_sparse.tocsr()
+    #     coo = coo_matrix(cos_sim_sparse)
+    #     rows, cols, values = coo.row, coo.col, coo.data
+
+    #     all_similarities = []
+    #     for i, j, value in zip(rows, cols, values):
+    #         if i != j:
+    #             all_similarities.append([group_indices[i], group_indices[j], value])
+
+    #     sim_df = pd.DataFrame(
+    #         all_similarities,
+    #         columns=[
+    #             f"{column_name}_1_index",
+    #             f"{column_name}_2_index",
+    #             f"{column_name}_similarity",
+    #         ],
+    #     )
+    #     return sim_df
