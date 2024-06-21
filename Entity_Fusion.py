@@ -21,8 +21,23 @@ import os
 import datetime
 
 
-class Entity_Fusion:
-    def __init__(self, 
+class EntityFusion:
+    def __init__(self):
+        self.df = None
+        self.column_thresholds = None
+        self.id_column = None
+        self.conditional = None
+        self.pre_clustered_df = None
+        self.df_sim = None
+        self.graph = None
+        self.clusters = None
+        self.clustered_csv_path = None
+        self.graph_path = None
+        self.save_copies = None
+        self.stopwords = set(ENGLISH_STOP_WORDS)
+        self.compare = False
+        
+    def initialize_parameters(self, 
                  df, 
                  id_column,
                  column_thresholds, 
@@ -123,9 +138,6 @@ class Entity_Fusion:
 
         # Determine the top_n based on the threshold
         top_n = 10  # Adjust this based on your requirement or make it a parameter
-
-        if group_tfidf.shape[0] > 5_000:
-            progress_bar = True
 
         # Use multiple threads to compute top-N cosine similarities
         n_threads = 4  # Adjust this based on your machine's capability
@@ -349,6 +361,10 @@ class Entity_Fusion:
     
 
     def cluster_data(self):
+        # Check if the parameters have been initialized
+        if self.df is None or self.column_thresholds is None or self.id_column is None:
+            raise ValueError("Parameters have not been initialized. Please call initialize_parameters() first.")
+
         self.create_similarity_matrices()
         self._construct_similarity_graph()
         self.clusters = self._find_clusters_from_graph(self.graph)
@@ -360,7 +376,6 @@ class Entity_Fusion:
             matched['matched'] = np.where(matched['matched'] == 2, True, False)
             self.df = self.df.merge(matched, on='cluster_label', how='left')
 
-        # Save the graph and clusters to storage
         if self.save_copies:
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             clustered_csv_path = f"{os.path.splitext(self.clustered_csv_path)[0]}_{timestamp}.csv"
