@@ -19,6 +19,7 @@ from collections import deque, Counter, defaultdict
 from multiprocessing import Pool, cpu_count
 import pickle
 import os
+import datetime
 
 
 class Entity_Fusion:
@@ -29,13 +30,15 @@ class Entity_Fusion:
                  df2=None, 
                  conditional='OR', 
                  pre_clustered_df=None, 
-                 clustered_csv_path='clustered_data.csv', 
-                 graph_path='graph.pkl'):
+                 clustered_csv_path='cluster_files/clustered_data.csv', 
+                 graph_path='cluster_files/graph.pkl',
+                 save_copies=True):
         # Ensure ID column is specified and unique
         if id_column not in df.columns:
             raise ValueError(f"The ID column '{id_column}' is not present in the dataframe.")
         
         if df2 is not None:
+            # Need to add warning that the 'existing data' will be treated as dataframe 1 if it's included
             self.compare = True
             df['df'] = 1
             df2['df'] = 2
@@ -61,6 +64,7 @@ class Entity_Fusion:
         self.clusters = None
         self.clustered_csv_path = clustered_csv_path
         self.graph_path = graph_path
+        self.save_copies = save_copies
         self.stopwords = set(ENGLISH_STOP_WORDS)
         
         # Load existing clustered data and graph if they exist
@@ -399,8 +403,16 @@ class Entity_Fusion:
             self.df = self.df.merge(matched, on='cluster_label', how='left')
 
         # Save the graph and clusters to storage
-        self.df.to_csv(self.clustered_csv_path, index=False)
-        with open(self.graph_path, 'wb') as file:
+        if self.save_copies:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            clustered_csv_path = f"{os.path.splitext(self.clustered_csv_path)[0]}_{timestamp}.csv"
+            graph_path = f"{os.path.splitext(self.graph_path)[0]}_{timestamp}.pkl"
+        else:
+            clustered_csv_path = self.clustered_csv_path
+            graph_path = self.graph_path
+
+        self.df.to_csv(clustered_csv_path, index=False)
+        with open(graph_path, 'wb') as file:
             pickle.dump(self.graph, file)
         return self.df
 
