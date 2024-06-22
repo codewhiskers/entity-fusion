@@ -62,6 +62,7 @@ class Entity_Fusion:
                 raise ValueError(
                     f"ID conflict detected between df1 and df2. Conflicting IDs: {conflicting_ids}"
                 )
+            self.df2 = df2
         else:
             self.compare = False
 
@@ -95,9 +96,16 @@ class Entity_Fusion:
             self.df = pd.concat([existing_data, df], ignore_index=True)
         else:
             self.df = df.reset_index(drop=True)
-        self.df['df'] = 1  # Add a column to differentiate between the two dataframes
-        self.df2 = df2.reset_index(drop=True) if df2 is not None else None
-        self.df2['df'] = 2  # Add a column to differentiate between the two dataframes
+        # Stack indices for the two dataframes
+        if self.compare:
+            self.df['df'] = 1  # Add a column to differentiate between the two dataframes
+            self.df2['df'] = 2  # Add a column to differentiate between the two dataframes
+            joined_for_indices = pd.concat([self.df, self.df2], ignore_index=True)  
+            joined_for_indices = joined_for_indices.reset_index(drop=True)
+            self.df = joined_for_indices[joined_for_indices['df'] == 1]
+            self.df2 = joined_for_indices[joined_for_indices['df'] == 2]
+        
+        
 
     def _find_common_prefixes_and_postfixes(self, data, min_length=2):
         threshold = 5
@@ -148,8 +156,6 @@ class Entity_Fusion:
         if data2 is not None:
             for idx, value in enumerate(data2):
                 value_to_indices[value].append(group_indices2[idx])
-        # pdb.set_trace()
-        # print(f"value_to_indices: {value_to_indices}")
         
         for indices in tqdm(
             value_to_indices.values(),
@@ -186,9 +192,6 @@ class Entity_Fusion:
                 group_tfidf, group_indices, column_name, group_tfidf2, group_indices2
             )
 
-        if group_tfidf.shape[0] > 5_000:
-            progress_bar = True
-
         def compute_cosine_similarity_chunk(start_idx, end_idx, group_tfidf, threshold, group_tfidf2=None):
             if group_tfidf2 is not None:
                 chunk_matrix = cosine_similarity(
@@ -204,8 +207,7 @@ class Entity_Fusion:
 
         chunk_size = 2_000
         n_samples = group_tfidf.shape[0]
-        cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
-        
+
         if group_tfidf2 is not None:
             n_samples2 = group_tfidf2.shape[0]
             cos_sim_sparse = lil_matrix((n_samples, n_samples2), dtype=np.float32)
@@ -214,22 +216,23 @@ class Entity_Fusion:
                 start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(
                     start_idx, end_idx, group_tfidf, threshold, group_tfidf2
                 )
-                cos_sim_sparse[start_idx:end_idx] = chunk_matrix
+                cos_sim_sparse[start_idx:end_idx, :] = chunk_matrix
         else:
+            cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
             for start_idx in tqdm(range(0, n_samples, chunk_size), desc=f"Computing cosine similarity in chunks for {column_name}", leave=False):
                 end_idx = min(start_idx + chunk_size, n_samples)
                 start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(
                     start_idx, end_idx, group_tfidf, threshold
                 )
-                cos_sim_sparse[start_idx:end_idx] = chunk_matrix
-        
+                cos_sim_sparse[start_idx:end_idx, :] = chunk_matrix
+
         cos_sim_sparse = cos_sim_sparse.tocsr()
         coo = coo_matrix(cos_sim_sparse)
         rows, cols, values = coo.row, coo.col, coo.data
 
         group_indices = np.array(group_indices)
         if group_tfidf2 is not None:
-            group_indices2 = np.array(range(len(self.df), len(self.df) + len(self.df2)))
+            group_indices2 = np.array(group_indices2)
             all_similarities = np.vstack(
                 (
                     group_indices[rows],
@@ -270,27 +273,27 @@ class Entity_Fusion:
         similarity_method,
         threshold,
         group2=None,
-        X_tfidf2=None
+        # X_tfidf2=None
     ):
-        group_indices = group[self.id_column].tolist()
-
+        group_indices = group.index.tolist()
+        # pdb.set_trace()
         if group2 is not None:
-            group_indices2 = group2[self.id_column].tolist()
-
+            group_indices2 = group2.index.tolist()
             if similarity_method == "tfidf" or similarity_method == "numeric":
                 group_tfidf = X_tfidf[group_indices, :]
-                group_tfidf2 = X_tfidf2[group_indices2, :]
+                group_tfidf2 = X_tfidf[group_indices2, :]
             elif similarity_method == "numeric_exact":
                 group_tfidf = group[column].tolist()
                 group_tfidf2 = group2[column].tolist()
+
         else:
-            group_indices2 = None
             group_tfidf2 = None
             if similarity_method == "tfidf" or similarity_method == "numeric":
                 group_tfidf = X_tfidf[group_indices, :]
             elif similarity_method == "numeric_exact":
                 group_tfidf = group[column].tolist()
-                
+        # if not group[group['corporation_name'].str.contains('K & J')].empty:
+        #     pdb.set_trace()
         # pdb.set_trace()
         grouped_processed_df = self._create_similarity_matrix(
             group_tfidf,
@@ -322,11 +325,10 @@ class Entity_Fusion:
 
     def group_dataframe(self, df, params, column):
         df = df[df[column].notnull()]
-        df = df[df[column].str.contains(r"\d")]
         df = df[df[column] != ""]
         df = df[df[column] != "nan"]
         df = df[df[column] != "None"]
-
+        
         blocking_criteria = params.get("blocking_criteria", None)
 
         if blocking_criteria is not None:
@@ -394,26 +396,26 @@ class Entity_Fusion:
                 df2 = self.df2.copy()
                 df2[column] = df2[column].astype(str)
                 data2 = df2[column].tolist()
-                X_tfidf2 = vectorizer.transform(data2) if similarity_method in ["tfidf", "numeric"] else df2
-
+                X_tfidf = vectorizer.transform(data + data2) if similarity_method in ["tfidf", "numeric"] else df2
                 grouped_data1 = self.group_dataframe(df, params, column)
                 grouped_data2 = self.group_dataframe(df2, params, column)
 
                 grouped_processed_dfs_list = []
-                
-                for (group_name1, group1), (group_name2, group2) in zip(grouped_data1, grouped_data2):
-                    result = self.process_group(
-                        group_name1,
-                        group1,
-                        column,
-                        X_tfidf,
-                        similarity_method,
-                        params["threshold"],
-                        group2,
-                        X_tfidf2
-                    )
-                    # pdb.set_trace()
-                    grouped_processed_dfs_list.append(result)
+
+                for (group_name1, group1) in grouped_data1:
+                    for (group_name2, group2) in grouped_data2:
+                        if group_name1 == group_name2:
+                            result = self.process_group(
+                                group_name1,
+                                group1,
+                                column,
+                                X_tfidf,
+                                similarity_method,
+                                params["threshold"],
+                                group2,
+                                # X_tfidf2
+                            )
+                            grouped_processed_dfs_list.append(result)
 
                 grouped_processed_dfs = pd.concat(
                     grouped_processed_dfs_list, ignore_index=True
@@ -562,6 +564,7 @@ class Entity_Fusion:
 
     def cluster_data(self):
         # Check if the parameters have been initialized
+        
         if self.df is None or self.column_thresholds is None or self.id_column is None:
             raise ValueError(
                 "Parameters have not been initialized. Please call initialize_parameters() first."
@@ -586,7 +589,8 @@ class Entity_Fusion:
             # Concatenate df and df2
             # concatenated_df = pd.concat([self.df, self.df2], ignore_index=True)
         # else:
-        self.df["cluster_label"] = self.df[self.id_column].map(self.clusters)
+        
+        self.df["cluster_label"] = self.df.index.map(self.clusters)
         # concatenated_df = self.df
         pdb.set_trace()
         self.df = self.find_unclustered(self.df)
