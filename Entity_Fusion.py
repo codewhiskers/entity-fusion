@@ -80,21 +80,23 @@ class Entity_Fusion:
         self.stopwords = set(ENGLISH_STOP_WORDS)
 
         # Load existing clustered data and graph if they exist
-        if os.path.exists(self.clustered_csv_path):
-            existing_data = pd.read_csv(self.clustered_csv_path)
-            with open(self.graph_path, "rb") as file:
-                self.graph = pickle.load(file)
+        
+        if self.clustered_csv_path is not None:
+            if os.path.exists(self.clustered_csv_path):
+                existing_data = pd.read_csv(self.clustered_csv_path)
+                with open(self.graph_path, "rb") as file:
+                    self.graph = pickle.load(file)
 
-            # Verify that IDs do not conflict
-            conflicting_ids = set(df[self.id_column]).intersection(
-                set(existing_data[self.id_column])
-            )
-            if conflicting_ids:
-                raise ValueError(
-                    f"ID conflict detected between new data and existing clustered data. Conflicting IDs: {conflicting_ids}"
+                # Verify that IDs do not conflict
+                conflicting_ids = set(df[self.id_column]).intersection(
+                    set(existing_data[self.id_column])
                 )
+                if conflicting_ids:
+                    raise ValueError(
+                        f"ID conflict detected between new data and existing clustered data. Conflicting IDs: {conflicting_ids}"
+                    )
 
-            self.df = pd.concat([existing_data, df], ignore_index=True)
+                self.df = pd.concat([existing_data, df], ignore_index=True)
         else:
             self.df = df.reset_index(drop=True)
         # Stack indices for the two dataframes
@@ -573,7 +575,7 @@ class Entity_Fusion:
             self.df = pd.concat([self.df, self.df2], ignore_index=True)
 
         self.df["cluster_label"] = self.df[self.id_column].map(self.clusters)
-        pdb.set_trace()
+        
         self.df = self.find_unclustered(self.df)
         if self.compare:
             matched = self.df.groupby("cluster_label")["df"].nunique().reset_index()
@@ -581,21 +583,21 @@ class Entity_Fusion:
             matched["matched"] = np.where(matched["matched"] == 2, True, False)
             self.df = self.df.merge(matched, on="cluster_label", how="left")
 
-        if self.save_copies:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            clustered_csv_path = (
-                f"{os.path.splitext(self.clustered_csv_path)[0]}_{timestamp}.csv"
-            )
-            graph_path = f"{os.path.splitext(self.graph_path)[0]}_{timestamp}.pkl"
-        else:
-            clustered_csv_path = self.clustered_csv_path
-            graph_path = self.graph_path
+        # if self.save_copies & self.clustered_csv_path is not None:
+        #     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        #     clustered_csv_path = (
+        #         f"{os.path.splitext(self.clustered_csv_path)[0]}_{timestamp}.csv"
+        #     )
+        #     graph_path = f"{os.path.splitext(self.graph_path)[0]}_{timestamp}.pkl"
+        # else:
+        #     clustered_csv_path = self.clustered_csv_path
+        #     graph_path = self.graph_path
         
-        if clustered_csv_path is not None:
-            self.df.to_csv(clustered_csv_path, index=False)
-        if graph_path is not None:
-            with open(graph_path, "wb") as file:
-                pickle.dump(self.graph, file)
+        # if clustered_csv_path is not None:
+        #     self.df.to_csv(clustered_csv_path, index=False)
+        # if graph_path is not None:
+        #     with open(graph_path, "wb") as file:
+        #         pickle.dump(self.graph, file)
         return self.df
 
     def return_cluster_data_logic_dataframe(self):
