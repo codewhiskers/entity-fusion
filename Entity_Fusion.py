@@ -316,10 +316,11 @@ class Entity_Fusion:
             return pd.DataFrame(columns=["id1", "id2", f"{column}_similarity"])
 
     def group_dataframe(self, df, params, column):
-        df = df[df[column].notnull()]
-        df = df[df[column] != ""]
-        df = df[df[column] != "nan"]
-        df = df[df[column] != "None"]
+        # Combine filtering conditions into a single operation
+        df = df[(df[column].notnull()) & 
+                (df[column] != "") & 
+                (df[column].str.lower() != "nan") & 
+                (df[column].str.lower() != "none")]
         
         blocking_criteria = params.get("blocking_criteria", None)
 
@@ -330,24 +331,25 @@ class Entity_Fusion:
                 new_groups = []
                 for group in grouped_data:
                     if criterion == "first_letter":
-                        new_groups.extend(list(group.groupby(group[column].str[0])))
+                        new_groups.extend(list(group.groupby(group[column].str[0], sort=False)))
                     elif criterion == "blocking_column":
                         blocking_columns = params.get("blocking_column")
                         if isinstance(blocking_columns, list):
                             new_groups.extend(
                                 list(
                                     group.groupby(
-                                        [group[col] for col in blocking_columns]
+                                        [group[col] for col in blocking_columns], sort=False
                                     )
                                 )
                             )
                         else:
                             new_groups.extend(
-                                list(group.groupby(group[blocking_columns]))
+                                list(group.groupby(group[blocking_columns], sort=False))
                             )
                     else:
                         raise ValueError(f"Unsupported criterion: {criterion}")
 
+                # Filter out groups with a single entry
                 grouped_data = [grp for _, grp in new_groups if len(grp) > 1]
 
             return [(group_name, group) for group_name, group in new_groups]
