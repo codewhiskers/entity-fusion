@@ -754,10 +754,19 @@ class Entity_Fusion:
         )
         display(fig)
 
+
+
+
     def generate_cluster_javascript(self, cluster_id, hover_columns=None, threshold=3, size_multiplier=10):
-        import json
-        import networkx as nx
-        from collections import defaultdict
+        """
+        Generate a JavaScript file for a specific cluster with supernodes and individual nodes.
+
+        Parameters:
+            cluster_id (int): The cluster ID to extract.
+            hover_columns (list): List of columns to include as hover attributes.
+            threshold (int): Minimum number of neighbors to form a super cluster.
+            size_multiplier (int): Multiplier to determine node size based on group size.
+        """
 
         # Create a NetworkX graph
         G = nx.Graph()
@@ -772,14 +781,14 @@ class Entity_Fusion:
         visited = set()
 
         for node in G.nodes:
-            if node not in visited:
+            if node not in visited and self.clusters.get(node) == cluster_id:
                 # Find neighbors within the same cluster
                 neighbors = [
-                    n for n in G.neighbors(node) if self.clusters.get(n) == self.clusters.get(node)
+                    n for n in G.neighbors(node) if self.clusters.get(n) == cluster_id
                 ]
                 if len(neighbors) >= threshold:
                     # Mark node and neighbors as part of the super cluster
-                    super_clusters[self.clusters[node]].append([node] + neighbors)
+                    super_clusters[cluster_id].append([node] + neighbors)
                     visited.update([node] + neighbors)
 
         # Create Cytoscape elements
@@ -813,7 +822,7 @@ class Entity_Fusion:
                 })
 
         # Add individual nodes not part of any super cluster
-        remaining_nodes = set(G.nodes) - visited
+        remaining_nodes = {node for node in G.nodes if self.clusters.get(node) == cluster_id} - visited
         for node in remaining_nodes:
             # Extract attribute values dynamically from the dataframe
             attributes = {}
@@ -833,25 +842,27 @@ class Entity_Fusion:
 
         # Add edges
         for u, v in G.edges:
-            # Map nodes to supernodes if applicable
-            source = node_to_supernode.get(u, str(u))
-            target = node_to_supernode.get(v, str(v))
+            if self.clusters.get(u) == cluster_id and self.clusters.get(v) == cluster_id:
+                # Map nodes to supernodes if applicable
+                source = node_to_supernode.get(u, str(u))
+                target = node_to_supernode.get(v, str(v))
 
-            # Avoid duplicate edges between supernodes
-            if source != target:
-                elements["edges"].append({
-                    "data": {
-                        "source": source,
-                        "target": target
-                    }
-                })
+                # Avoid duplicate edges between supernodes
+                if source != target:
+                    elements["edges"].append({
+                        "data": {
+                            "source": source,
+                            "target": target
+                        }
+                    })
 
         # Save as JavaScript for use in Cytoscape
-        output_path = "network_graph_with_super_clusters.js"
+        output_path = f"cluster_{cluster_id}_graph.js"
         with open(output_path, "w") as f:
             f.write(f"const data = {json.dumps(elements, indent=4)};")
 
-        print(f"Super cluster graph saved as {output_path}")
+        print(f"Cluster graph for cluster {cluster_id} saved as {output_path}")
+
 
 
 
