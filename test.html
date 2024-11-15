@@ -188,31 +188,40 @@
 
             // Move node to Selected Table
             const moveToSelected = (nodeId) => {
-                const row = unselectedRows.find(row => row.id === nodeId);
-                if (row) {
+                // Find all rows corresponding to the nodeId
+                const rowsToMove = unselectedRows.filter(row => row.id === nodeId);
+                if (rowsToMove.length > 0) {
+                    // Remove the rows from unselectedRows
                     unselectedRows = unselectedRows.filter(row => row.id !== nodeId);
-                    selectedRows.push(row);
+
+                    // Add rows to selectedRows
+                    selectedRows.push(...rowsToMove);
 
                     // Update tables
                     DataTableManager.getInstance('datatable-unselected').clear().rows.add(unselectedRows).draw();
-                    // Initialize tables
+
+                    // Reinitialize or update the selected table
                     DataTableManager.initializeDataTable({
                         rows: selectedRows,
                         tableId: 'datatable-selected',
                         tableHeadId: 'datatable-head-selected',
                         filterRowId: 'datatable-filter-row-selected',
                         columnTitleMap: columnTitleMap,
-                        callback: (dataTable) => console.log("Selected table initialized")
+                        callback: (dataTable) => console.log("Selected table updated")
                     });
                 }
             };
 
             // Move node to Unselected Table
             const moveToUnselected = (nodeId) => {
-                const row = selectedRows.find(row => row.id === nodeId);
-                if (row) {
+                // Find all rows corresponding to the nodeId
+                const rowsToMove = selectedRows.filter(row => row.id === nodeId);
+                if (rowsToMove.length > 0) {
+                    // Remove the rows from selectedRows
                     selectedRows = selectedRows.filter(row => row.id !== nodeId);
-                    unselectedRows.push(row);
+
+                    // Add rows to unselectedRows
+                    unselectedRows.push(...rowsToMove);
 
                     // Update tables
                     DataTableManager.getInstance('datatable-selected').clear().rows.add(selectedRows).draw();
