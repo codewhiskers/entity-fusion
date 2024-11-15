@@ -7,16 +7,32 @@ const DataTableManager = (function () {
             return;
         }
 
-        // Determine columns dynamically or fallback to a placeholder for empty rows
-        const columns = rows.length > 0
-            ? Object.keys(rows[0]).map(key => ({
-                data: key,
-                title: columnTitleMap[key] || key,
-                defaultContent: '' // Avoid undefined errors
-            }))
-            : [{ data: null, title: 'No Data', defaultContent: 'No records to display' }];
+        // Filter the rows to include only the specified columns (plus `id` for interactivity)
+        const filteredRows = rows.map(row => {
+            const filteredRow = {};
+            Object.keys(columnTitleMap).forEach(key => {
+                filteredRow[key] = row[key]; // Include columns specified in columnTitleMap
+            });
+            filteredRow["id"] = row["id"]; // Always include the `id` column for interactivity
+            return filteredRow;
+        });
 
-        console.log("Rows: ", rows);
+        // Generate column definitions based on columnTitleMap
+        const columns = Object.keys(columnTitleMap).map(key => ({
+            data: key,
+            title: columnTitleMap[key] || key,
+            defaultContent: '' // Avoid undefined errors
+        }));
+
+        // Always include the `id` column as a hidden column
+        columns.push({
+            data: "id",
+            title: "Node ID (Hidden)",
+            visible: false, // Hide the `id` column in the table
+            defaultContent: ''
+        });
+
+        console.log("Filtered Rows: ", filteredRows);
         console.log("Columns: ", columns);
 
         // Check if the table already exists
@@ -25,7 +41,7 @@ const DataTableManager = (function () {
 
             // Clear and re-add rows
             dataTable.clear();
-            dataTable.rows.add(rows);
+            dataTable.rows.add(filteredRows);
             dataTable.draw();
             return; // Skip the rest of the initialization process
         }
@@ -69,7 +85,7 @@ const DataTableManager = (function () {
 
         // Initialize DataTable
         const dataTable = $(`#${tableId}`).DataTable({
-            data: rows,
+            data: filteredRows,
             columns: columns,
             paging: true,
             searching: true,

@@ -7,7 +7,7 @@
     padding: 20px;
     border-radius: 20px;
     border: 2px solid black;
-    font-size: 0.85rem;
+    font-size: 0.4rem;
 }
 
 body {
@@ -26,4 +26,10 @@ table.dataTable tbody tr.selected {
     /* Light blue background */
     color: #000;
     /* Black text */
+}
+
+#datatable-unselected,
+#datatable-selected {
+    font-size: 8px !important;
+    /* Adjust to your desired size */
 }
