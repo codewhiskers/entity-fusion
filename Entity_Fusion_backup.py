@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+
 np.seterr(divide="ignore", invalid="ignore")  # need to fix this later
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -28,8 +29,8 @@ class Entity_Fusion:
             )
 
         # Separate the DataFrame into pre-clustered and unclustered parts
-        pre_clustered_df = self.df[self.df['cluster_label'].notnull()].copy()
-        unclustered_df = self.df[self.df['cluster_label'].isnull()].copy()
+        pre_clustered_df = self.df[self.df["cluster_label"].notnull()].copy()
+        unclustered_df = self.df[self.df["cluster_label"].isnull()].copy()
         if unclustered_df.empty:
             print("No unclustered rows to process.")
             return self.df
@@ -39,10 +40,10 @@ class Entity_Fusion:
             pre_clustered_df = pre_clustered_df.reset_index(drop=True)
             self.df.reset_index(drop=True, inplace=True)
             combined_df = pd.concat([pre_clustered_df, self.df], ignore_index=True)
-            
+
             pre_clustered_indices = pre_clustered_df.index
             unclustered_indices = self.df.index + len(pre_clustered_df)
-            
+
             self.df_sim = self._create_combined_similarity_matrix(
                 combined_df, pre_clustered_indices, unclustered_indices
             )
@@ -52,7 +53,7 @@ class Entity_Fusion:
         self.create_similarity_matrices()
         self._construct_similarity_graph()
         self.clusters = self._find_clusters_from_graph(self.graph)
-        
+
         self.df["cluster_label"] = self.df[self.id_column].map(self.clusters)
         self.df = self.find_unclustered(self.df)
         if self.compare:
@@ -64,17 +65,10 @@ class Entity_Fusion:
         return self.df
 
     def _create_similarity_matrix(
-        self,
-        group_tfidf,
-        group_ids,
-        column_name,
-        threshold,
-        similarity_method
+        self, group_tfidf, group_ids, column_name, threshold, similarity_method
     ):
         if similarity_method == "exact":
-            return self._create_exact_match_matrix(
-                group_tfidf, group_ids, column_name
-            )
+            return self._create_exact_match_matrix(group_tfidf, group_ids, column_name)
 
         def compute_cosine_similarity_chunk(start_idx, end_idx, group_tfidf, threshold):
             chunk_matrix = cosine_similarity(
@@ -86,16 +80,20 @@ class Entity_Fusion:
 
         chunk_size = 2_000
         n_samples = group_tfidf.shape[0]
-        
+
         if n_samples > 5_000:
             use_progress_bar = True
         else:
             use_progress_bar = False
-        
+
         cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
         iter_range = range(0, n_samples, chunk_size)
         if use_progress_bar:
-            iter_range = tqdm(iter_range, desc=f"Computing cosine similarity in chunks for {column_name}", leave=False)
+            iter_range = tqdm(
+                iter_range,
+                desc=f"Computing cosine similarity in chunks for {column_name}",
+                leave=False,
+            )
         for start_idx in iter_range:
             end_idx = min(start_idx + chunk_size, n_samples)
             start_idx, end_idx, chunk_matrix = compute_cosine_similarity_chunk(
@@ -132,13 +130,21 @@ class Entity_Fusion:
         )
         return sim_df
 
-    def _create_combined_similarity_matrix(self, pre_clustered_df, unclustered_df, pre_clustered_indices, unclustered_indices):
+    def _create_combined_similarity_matrix(
+        self,
+        pre_clustered_df,
+        unclustered_df,
+        pre_clustered_indices,
+        unclustered_indices,
+    ):
         processed_dfs = []
 
         for column, params in self.column_thresholds.items():
             pre_clustered_df[column] = pre_clustered_df[column].astype(str)
             unclustered_df[column] = unclustered_df[column].astype(str)
-            combined_df = pd.concat([pre_clustered_df, unclustered_df], ignore_index=True)
+            combined_df = pd.concat(
+                [pre_clustered_df, unclustered_df], ignore_index=True
+            )
             similarity_method = params.get("similarity_method", "tfidf")
 
             if similarity_method == "numeric":
@@ -151,7 +157,7 @@ class Entity_Fusion:
                 X_tfidf = vectorizer.fit_transform(combined_df[column])
             elif similarity_method == "tfidf":
                 vectorizer = TfidfVectorizer(
-                    analyzer='char_wb',
+                    analyzer="char_wb",
                     preprocessor=None,
                     lowercase=True,
                     ngram_range=(2, 3),
@@ -164,18 +170,22 @@ class Entity_Fusion:
             elif similarity_method == "exact":
                 vectorizer = None
                 X_tfidf = combined_df
-                params['threshold'] = 1
+                params["threshold"] = 1
 
             grouped_data = self.group_dataframe(combined_df, params, column)
 
             grouped_processed_dfs_list = []
-            for _, group in tqdm(
-                grouped_data, desc=f"Processing groups for {column}"
-            ):
-                group_tfidf = X_tfidf[group.index, :] if vectorizer is not None else group[column]
+            for _, group in tqdm(grouped_data, desc=f"Processing groups for {column}"):
+                group_tfidf = (
+                    X_tfidf[group.index, :] if vectorizer is not None else group[column]
+                )
 
-                pre_group_tfidf = group_tfidf[np.isin(group.index, pre_clustered_indices), :]
-                un_group_tfidf = group_tfidf[np.isin(group.index, unclustered_indices), :]
+                pre_group_tfidf = group_tfidf[
+                    np.isin(group.index, pre_clustered_indices), :
+                ]
+                un_group_tfidf = group_tfidf[
+                    np.isin(group.index, unclustered_indices), :
+                ]
 
                 # Process the similarities between pre-clustered and unclustered
                 result = self.process_group(
@@ -185,7 +195,7 @@ class Entity_Fusion:
                     similarity_method,
                     params["threshold"],
                     pre_clustered_indices,
-                    unclustered_indices
+                    unclustered_indices,
                 )
                 grouped_processed_dfs_list.append(result)
 
@@ -212,7 +222,7 @@ class Entity_Fusion:
             df[column] = df[column].astype(str)
             similarity_method = params.get("similarity_method", "tfidf")
             data = df[column].tolist()
-            
+
             if similarity_method == "numeric":
                 vectorizer = TfidfVectorizer(
                     tokenizer=lambda x: re.findall(r"\d+", x),
@@ -223,7 +233,7 @@ class Entity_Fusion:
                 X_tfidf = vectorizer.fit_transform(data)
             elif similarity_method == "tfidf":
                 vectorizer = TfidfVectorizer(
-                    analyzer='char_wb',
+                    analyzer="char_wb",
                     preprocessor=None,
                     lowercase=True,
                     ngram_range=(2, 3),
@@ -236,8 +246,7 @@ class Entity_Fusion:
             elif similarity_method == "exact":
                 vectorizer = None
                 X_tfidf = df
-                params['threshold'] = 1
-            
+                params["threshold"] = 1
 
             grouped_data = self.group_dataframe(df, params, column)
 
@@ -249,9 +258,13 @@ class Entity_Fusion:
                     group_name,
                     group,
                     column,
-                    X_tfidf[group.index, :] if similarity_method in ["tfidf", "numeric"] else group[column],
+                    (
+                        X_tfidf[group.index, :]
+                        if similarity_method in ["tfidf", "numeric"]
+                        else group[column]
+                    ),
                     similarity_method,
-                    params["threshold"]
+                    params["threshold"],
                 )
                 grouped_processed_dfs_list.append(result)
 
@@ -273,27 +286,17 @@ class Entity_Fusion:
         return df_sim
 
     def process_group(
-        self,
-        group_name,
-        group,
-        column,
-        X_tfidf,
-        similarity_method,
-        threshold
+        self, group_name, group, column, X_tfidf, similarity_method, threshold
     ):
         group_ids = group[self.id_column].tolist()
-      
+
         if similarity_method == "tfidf" or similarity_method == "numeric":
             group_tfidf = X_tfidf
         elif similarity_method == "exact":
             group_tfidf = group[column].tolist()
 
         grouped_processed_df = self._create_similarity_matrix(
-            group_tfidf,
-            group_ids,
-            column,
-            threshold,
-            similarity_method
+            group_tfidf, group_ids, column, threshold, similarity_method
         )
 
         if not grouped_processed_df.empty:
@@ -321,13 +324,21 @@ class Entity_Fusion:
         similarity_method,
         threshold,
         pre_clustered_indices,
-        unclustered_indices
+        unclustered_indices,
     ):
         pre_group_tfidf, un_group_tfidf = group_tfidf
 
         group_ids = group[self.id_column].tolist()
-        pre_group_ids = [group_ids[i] for i in range(len(group_ids)) if np.isin(group.index[i], pre_clustered_indices)]
-        un_group_ids = [group_ids[i] for i in range(len(group_ids)) if np.isin(group.index[i], unclustered_indices)]
+        pre_group_ids = [
+            group_ids[i]
+            for i in range(len(group_ids))
+            if np.isin(group.index[i], pre_clustered_indices)
+        ]
+        un_group_ids = [
+            group_ids[i]
+            for i in range(len(group_ids))
+            if np.isin(group.index[i], unclustered_indices)
+        ]
 
         if similarity_method == "tfidf" or similarity_method == "numeric":
             similarity_matrix = cosine_similarity(un_group_tfidf, pre_group_tfidf)
@@ -371,7 +382,9 @@ class Entity_Fusion:
 
         masks = []
         for col, params in self.column_thresholds.items():
-            masks.append(self.df_sim[f"{col}_similarity"].astype(float) >= params["threshold"])
+            masks.append(
+                self.df_sim[f"{col}_similarity"].astype(float) >= params["threshold"]
+            )
 
         if self.conditional == "AND":
             final_mask = np.logical_and.reduce(masks)
@@ -383,17 +396,25 @@ class Entity_Fusion:
         if self.pre_clustered_df is not None:
             exclude_set = set(
                 zip(
-                    self.pre_clustered_df[self.pre_clustered_df["match"] == False]["id1"],
-                    self.pre_clustered_df[self.pre_clustered_df["match"] == False]["id2"],
+                    self.pre_clustered_df[self.pre_clustered_df["match"] == False][
+                        "id1"
+                    ],
+                    self.pre_clustered_df[self.pre_clustered_df["match"] == False][
+                        "id2"
+                    ],
                 )
             )
             reverse_exclude_set = set((y, x) for x, y in exclude_set)
             exclude_set.update(reverse_exclude_set)
-            
+
             include_set = set(
                 zip(
-                    self.pre_clustered_df[self.pre_clustered_df["match"] == True]["id1"],
-                    self.pre_clustered_df[self.pre_clustered_df["match"] == True]["id2"],
+                    self.pre_clustered_df[self.pre_clustered_df["match"] == True][
+                        "id1"
+                    ],
+                    self.pre_clustered_df[self.pre_clustered_df["match"] == True][
+                        "id2"
+                    ],
                 )
             )
             reverse_include_set = set((y, x) for x, y in include_set)
@@ -405,7 +426,7 @@ class Entity_Fusion:
         idx1 = filtered_df["id1"].values
         idx2 = filtered_df["id2"].values
         edges = list(zip(idx1, idx2))
-        
+
         # Create a hash map (dictionary) for fast ID lookup
         # id_map = self.df[self.id_column].to_dict()
 
@@ -423,9 +444,13 @@ class Entity_Fusion:
                 self.graph[edge[1]].add(edge[0])
 
         for id1, id2 in include_set:
-            try: # Need to fix this later
-                node1 = self.df[self.df[self.id_column] == id1][self.id_column].values[0]
-                node2 = self.df[self.df[self.id_column] == id2][self.id_column].values[0]
+            try:  # Need to fix this later
+                node1 = self.df[self.df[self.id_column] == id1][self.id_column].values[
+                    0
+                ]
+                node2 = self.df[self.df[self.id_column] == id2][self.id_column].values[
+                    0
+                ]
                 self.graph[node1].add(node2)
                 self.graph[node2].add(node1)
             except:
@@ -436,12 +461,14 @@ class Entity_Fusion:
 
     def group_dataframe(self, df, params, column):
         # Combine filtering conditions into a single operation
-        df = df[(df[column].notnull()) & 
-                (df[column] != "") & 
-                (df[column] != "Unknown") & 
-                (df[column].str.lower() != "nan") & 
-                (df[column].str.lower() != "none")]
-        
+        df = df[
+            (df[column].notnull())
+            & (df[column] != "")
+            & (df[column] != "Unknown")
+            & (df[column].str.lower() != "nan")
+            & (df[column].str.lower() != "none")
+        ]
+
         blocking_criteria = params.get("blocking_criteria", None)
 
         if blocking_criteria is not None:
@@ -451,14 +478,17 @@ class Entity_Fusion:
                 new_groups = []
                 for group in grouped_data:
                     if criterion == "first_letter":
-                        new_groups.extend(list(group.groupby(group[column].str[0], sort=False)))
+                        new_groups.extend(
+                            list(group.groupby(group[column].str[0], sort=False))
+                        )
                     elif criterion == "blocking_column":
                         blocking_columns = params.get("blocking_column")
                         if isinstance(blocking_columns, list):
                             new_groups.extend(
                                 list(
                                     group.groupby(
-                                        [group[col] for col in blocking_columns], sort=False
+                                        [group[col] for col in blocking_columns],
+                                        sort=False,
                                     )
                                 )
                             )
@@ -481,9 +511,9 @@ class Entity_Fusion:
         df,
         id_column,
         column_thresholds,
-        df2 = None,
+        df2=None,
         conditional="OR",
-        pre_clustered_df=None
+        pre_clustered_df=None,
     ):
         # Ensure ID column is specified and unique
         if id_column not in df.columns:
@@ -510,8 +540,8 @@ class Entity_Fusion:
         if df2 is not None:
             self.compare = True
             self.df2 = df2.reset_index(drop=True)
-            self.df['df'] = 1
-            self.df2['df'] = 2
+            self.df["df"] = 1
+            self.df2["df"] = 2
             self.df = pd.concat([self.df, self.df2], ignore_index=True)
             if not self.df[id_column].is_unique:
                 duplicated_ids = df[id_column][df[id_column].duplicated()].unique()
@@ -520,9 +550,9 @@ class Entity_Fusion:
                 )
         else:
             self.compare = False
-        if 'cluster_label' not in self.df.columns:
-            self.df['cluster_label'] = np.nan
-        
+        if "cluster_label" not in self.df.columns:
+            self.df["cluster_label"] = np.nan
+
     def _find_common_prefixes_and_postfixes(self, data, min_length=2):
         threshold = 5
         all_words = [word for text in data for word in text.split()]
@@ -541,34 +571,32 @@ class Entity_Fusion:
 
         # Get the maximum cluster label currently in the dataframe
         max_label = int(
-            df["cluster_label"].max()
-            if pd.notnull(df["cluster_label"].max())
-            else -1
+            df["cluster_label"].max() if pd.notnull(df["cluster_label"].max()) else -1
         )
-        
+
         # Find all rows where the cluster label is NaN
         unclustered_mask = df["cluster_label"].isnull()
-        
+
         # Count the number of unclustered rows
         num_unclustered = int(unclustered_mask.sum())
-        
+
         # Assign new cluster labels to unclustered rows
         df.loc[unclustered_mask, "cluster_label"] = range(
             max_label + 1, max_label + 1 + num_unclustered
         )
 
         return df
-        
+
     def merge_dataframes(self, left_df, right_df):
         return pd.merge(left_df, right_df, on=["id1", "id2"], how="outer")
-        
+
     def _create_exact_match_matrix(self, data, group_ids, column_name):
         matches = []
         value_to_indices = defaultdict(list)
-        
+
         for idx, value in enumerate(data):
             value_to_indices[value].append(group_ids[idx])
-        
+
         for indices in tqdm(
             value_to_indices.values(),
             desc=f"Processing exact matches for {column_name}",
@@ -577,7 +605,7 @@ class Entity_Fusion:
                 for i in range(len(indices)):
                     for j in range(i + 1, len(indices)):
                         matches.append([indices[i], indices[j], 1])
-        
+
         match_df = pd.DataFrame(
             matches,
             columns=[
@@ -586,12 +614,14 @@ class Entity_Fusion:
                 f"{column_name}_similarity",
             ],
         )
-        
+
         return match_df
-    
+
     def update_clusters_with_new_data(self, old_df, new_df, old_cluster_label_col):
         if old_cluster_label_col not in old_df.columns:
-            raise ValueError(f"Old dataframe does not have '{old_cluster_label_col}' column")
+            raise ValueError(
+                f"Old dataframe does not have '{old_cluster_label_col}' column"
+            )
 
         new_df["cluster_label"] = np.nan
         self.df = pd.concat([old_df, new_df], ignore_index=True)
@@ -611,15 +641,19 @@ class Entity_Fusion:
             if pd.notna(old_cluster) and new_cluster is not None:
                 if old_cluster not in old_to_new_cluster_map:
                     old_to_new_cluster_map[old_cluster] = new_cluster
-        self.df[old_cluster_label_col] = self.df[old_cluster_label_col].map(old_to_new_cluster_map).fillna(self.df["cluster_label"])
-        
+        self.df[old_cluster_label_col] = (
+            self.df[old_cluster_label_col]
+            .map(old_to_new_cluster_map)
+            .fillna(self.df["cluster_label"])
+        )
+
         # Update self.clusters with the old cluster IDs
         for old_cluster, new_cluster in old_to_new_cluster_map.items():
             for node, cluster_id in new_clusters.items():
                 if cluster_id == new_cluster:
                     new_clusters[node] = old_cluster
         self.clusters = new_clusters
-        
+
         return self.df
 
     def return_cluster_data_logic_dataframe(self):
@@ -705,7 +739,9 @@ class Entity_Fusion:
             if hover_columns:
                 for col in hover_columns:
                     if col in self.df.columns:
-                        col_value = self.df[self.df[self.id_column]==node][col].values[0]
+                        col_value = self.df[self.df[self.id_column] == node][
+                            col
+                        ].values[0]
                         hover_text += f"<br>{col}: {col_value}"
             hover_texts.append(hover_text)
 
@@ -754,10 +790,9 @@ class Entity_Fusion:
         )
         display(fig)
 
-
-
-
-    def generate_cluster_javascript(self, cluster_id, hover_columns=None, threshold=3, size_multiplier=10):
+    def generate_cluster_javascript(
+        self, cluster_id, hover_columns=None, threshold=3, size_multiplier=10
+    ):
         """
         Generate a JavaScript file for a specific cluster with supernodes and individual nodes.
 
@@ -806,23 +841,32 @@ class Entity_Fusion:
                 for node in group:
                     for col in hover_columns or []:
                         if col in self.df.columns:
-                            col_value = self.df[self.df[self.id_column] == node][col].values
+                            col_value = self.df[self.df[self.id_column] == node][
+                                col
+                            ].values
                             if len(col_value) > 0:
                                 aggregated_attributes[col].append(col_value[0])
 
                 # Add attributes to supernode
-                attributes = {col: aggregated_attributes[col] for col in aggregated_attributes}
-                elements["nodes"].append({
-                    "data": {
-                        "id": supernode_id,
-                        "label": f"Supernode {cluster_id}_{i}",
-                        "size": len(group) * size_multiplier,  # Size based on number of nodes in the cluster
-                        **attributes
+                attributes = {
+                    col: aggregated_attributes[col] for col in aggregated_attributes
+                }
+                elements["nodes"].append(
+                    {
+                        "data": {
+                            "id": supernode_id,
+                            "label": f"Supernode {cluster_id}_{i}",
+                            "size": len(group)
+                            * size_multiplier,  # Size based on number of nodes in the cluster
+                            **attributes,
+                        }
                     }
-                })
+                )
 
         # Add individual nodes not part of any super cluster
-        remaining_nodes = {node for node in G.nodes if self.clusters.get(node) == cluster_id} - visited
+        remaining_nodes = {
+            node for node in G.nodes if self.clusters.get(node) == cluster_id
+        } - visited
         for node in remaining_nodes:
             # Extract attribute values dynamically from the dataframe
             attributes = {}
@@ -831,30 +875,32 @@ class Entity_Fusion:
                     col_value = self.df[self.df[self.id_column] == node][col].values
                     attributes[col] = col_value[0] if len(col_value) > 0 else "N/A"
 
-            elements["nodes"].append({
-                "data": {
-                    "id": str(node),
-                    "label": str(node),
-                    "size": size_multiplier,  # Default size for individual nodes
-                    **attributes
+            elements["nodes"].append(
+                {
+                    "data": {
+                        "id": str(node),
+                        "label": str(node),
+                        "size": size_multiplier,  # Default size for individual nodes
+                        **attributes,
+                    }
                 }
-            })
+            )
 
         # Add edges
         for u, v in G.edges:
-            if self.clusters.get(u) == cluster_id and self.clusters.get(v) == cluster_id:
+            if (
+                self.clusters.get(u) == cluster_id
+                and self.clusters.get(v) == cluster_id
+            ):
                 # Map nodes to supernodes if applicable
                 source = node_to_supernode.get(u, str(u))
                 target = node_to_supernode.get(v, str(v))
 
                 # Avoid duplicate edges between supernodes
                 if source != target:
-                    elements["edges"].append({
-                        "data": {
-                            "source": source,
-                            "target": target
-                        }
-                    })
+                    elements["edges"].append(
+                        {"data": {"source": source, "target": target}}
+                    )
 
         # Save as JavaScript for use in Cytoscape
         output_path = f"cluster_{cluster_id}_graph.js"
@@ -862,10 +908,6 @@ class Entity_Fusion:
             f.write(f"const data = {json.dumps(elements, indent=4)};")
 
         print(f"Cluster graph for cluster {cluster_id} saved as {output_path}")
-
-
-
-
 
     def _find_clusters_from_graph(self, graph):
         def bfs(graph, start_node, visited):
