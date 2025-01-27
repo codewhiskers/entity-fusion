@@ -7,6 +7,7 @@ from tqdm import tqdm
 import pdb
 import re
 from collections import defaultdict, deque
+from sparse_dot_topn import awesome_cossim_topn, sp_matmul_topn
 
 
 class SimilarityMatrixGenerator:
@@ -205,26 +206,31 @@ class SimilarityCalculator:
         pass
 
 
+
+
     def _create_cosine_similarity_matrix(self, group_tfidf, group_ids, column_name, threshold):
         """
-        Create a cosine similarity matrix with a progress bar for chunks,
-        shown only if the number of chunks exceeds a threshold.
+        Create a cosine similarity matrix using `sparse_dot_topn` for large groups
+        and the original setup for small groups, without progress bars.
         """
         n_samples = group_tfidf.shape[0]
-        chunk_size = 2_000
-        num_chunks = (n_samples + chunk_size - 1) // chunk_size  # Calculate total chunks
-        show_progress_bar = num_chunks > 3  # Show progress bar only if chunks exceed threshold
-        cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
+        chunk_size = 2000
+        large_group_threshold = 500  # Use sparse_dot_topn for groups larger than this
 
-        # Outer progress bar, shown only when needed
-        progress_bar = tqdm(
-            total=n_samples,
-            desc=f"Processing chunks for {column_name}",
-            leave=False,
-            disable=not show_progress_bar,
-        )
+        if n_samples > large_group_threshold:
+            top_n = 100  # retain top-N similarities
 
-        try:
+            cos_sim_sparse = sp_matmul_topn(
+                group_tfidf,
+                group_tfidf,
+                top_n=top_n,
+                threshold=threshold,
+                n_threads=-1
+            )
+        # Use the original setup for small groups
+        else:
+            cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
+
             for start_idx in range(0, n_samples, chunk_size):
                 end_idx = min(start_idx + chunk_size, n_samples)
                 chunk_matrix = self._compute_cosine_similarity_chunk(
@@ -232,13 +238,7 @@ class SimilarityCalculator:
                 )
                 cos_sim_sparse[start_idx:end_idx, :] = chunk_matrix
 
-                # Update the progress bar
-                progress_bar.update(end_idx - start_idx)
-        finally:
-            progress_bar.close()  # Ensure progress bar is properly closed
-
         return self._finalize_similarity_matrix(cos_sim_sparse, group_ids, column_name)
-
 
     def _compute_cosine_similarity_chunk(self, start_idx, end_idx, group_tfidf, threshold):
         chunk_matrix = cosine_similarity(group_tfidf[start_idx:end_idx], group_tfidf)
@@ -264,7 +264,7 @@ class SimilarityCalculator:
         similarities = np.vstack((
             group_ids[filtered_rows],
             group_ids[filtered_cols],
-            filtered_values,
+            filtered_values, 
         )).T
 
         return similarities  # Return as NumPy array
@@ -316,15 +316,14 @@ class DataGrouper:
 
 
 if __name__ == "__main__":
-    df = pd.read_csv("public_up_to_150k_1_240930.csv", nrows=500_000, encoding="latin-1")
-    # df = df_ppp[0:5_000].copy()
+    df = pd.read_csv("public_up_to_150k_1_240930.csv", nrows=1_000_000, encoding="latin-1")
     df = df[["BorrowerName", "BorrowerAddress", "BorrowerCity"]]
     df.reset_index(inplace=True)
     column_threshold = {
         "BorrowerName": {
             "threshold": 0.9,
             "blocking_column": ["BorrowerCity"],
-            "blocking_criteria": ["blocking_column"],
+            "blocking_criteria": ["first_letter"],
             "similarity_method": "tfidf",
         },
         "BorrowerAddress": {
@@ -337,3 +336,33 @@ if __name__ == "__main__":
     EF = SimilarityMatrixGenerator(df, column_threshold)
     clustered_df = EF.cluster_data()
     print(clustered_df.head())
+
+
+        #     n_samples = group_tfidf.shape[0]
+        # chunk_size = 100_000
+        # # large_group_threshold = 10_000  # Use sparse_dot_topn for groups larger than this
+
+        # # Use sparse_dot_topn for large groups
+        # if n_samples > chunk_size:
+        #     top_n = min(100, n_samples - 1)  # Retain top-N similarities
+        #     cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
+
+        #     # Initialize progress bar
+        #     with tqdm(total=n_samples, desc=f"Processing {column_name}", leave=False) as progress_bar:
+        #         for start_idx in range(0, n_samples, chunk_size):
+        #             end_idx = min(start_idx + chunk_size, n_samples)
+
+        #             # Compute cosine similarity for this chunk
+        #             chunk_matrix = awesome_cossim_topn(
+        #                 group_tfidf[start_idx:end_idx],  # Current chunk
+        #                 group_tfidf,                    # Compare against the entire matrix
+        #                 ntop=top_n,                     # Retain only the top-N similarities
+        #                 lower_bound=threshold,          # Similarity threshold
+        #                 use_threads=True                # Enable threading for performance
+        #             )
+
+        #             # Store the chunk result in the sparse matrix
+        #             cos_sim_sparse[start_idx:end_idx, :] = chunk_matrix
+
+        #             # Update the progress bar
+        #             progress_bar.update(end_idx - start_idx)
