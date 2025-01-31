@@ -11,14 +11,18 @@ from sparse_dot_topn import awesome_cossim_topn, sp_matmul_topn
 
 
 class SimilarityMatrixGenerator:
-    def __init__(self, df, column_thresholds, combine_method="OR"):
+    def __init__(self, df, conditions):
+        """
+        Args:
+            df (pd.DataFrame): The DataFrame to cluster
+            conditions (dict): A nested dictionary specifying the AND/OR logic
+        """
         self.df = df
-        self.column_thresholds = column_thresholds
-        self.df_sim = None
-        self.similarity_results = []  # will hold (column, column_results) pairs
+        self.conditions = conditions
         self.graph = defaultdict(set)
         self.clusters = {}
-        self.combine_method = combine_method.upper()  # "AND" or "OR"
+        self.similarity_calculator = SimilarityCalculator()
+        self.data_grouper = DataGrouper(self.df)
 
     def create_similarity_matrices(self):
         """
@@ -118,27 +122,11 @@ class SimilarityMatrixGenerator:
         # print("Similarity graph constructed.")
 
     def _find_clusters_from_graph(self):
-        """
-        Find clusters using connected components.
-        """
-
-        def bfs(graph, start_node, visited):
-            cluster = set()
-            queue = deque([start_node])
-            while queue:
-                node = queue.popleft()
-                if node not in visited:
-                    visited.add(node)
-                    cluster.add(node)
-                    queue.extend(graph[node] - visited)
-            return cluster
-
-        clusters = []
         visited = set()
-
+        clusters = []
         for node in self.graph.keys():
             if node not in visited:
-                cluster = bfs(self.graph, node, visited)
+                cluster = self._bfs_component(node, visited)
                 clusters.append(cluster)
 
         # Assign cluster IDs
@@ -146,90 +134,172 @@ class SimilarityMatrixGenerator:
         for cluster_id, cluster in enumerate(clusters):
             for node in cluster:
                 cluster_map[node] = cluster_id
-
         self.clusters = cluster_map
 
-    def assign_cluster_labels(self):
-        """
-        Assign cluster labels to the dataframe based on the graph clusters.
-        """
-        if not self.graph:
-            raise ValueError(
-                "Graph not constructed. Run _construct_similarity_graph first."
-            )
-        if not self.clusters:
-            raise ValueError("Clusters not found. Run _find_clusters_from_graph first.")
+    def _bfs_component(self, start_node, visited):
+        from collections import deque
 
-        # Map cluster labels to the dataframe
+        queue = deque([start_node])
+        component = set()
+        while queue:
+            node = queue.popleft()
+            if node not in visited:
+                visited.add(node)
+                component.add(node)
+                neighbors = self.graph[node]
+                for nb in neighbors:
+                    if nb not in visited:
+                        queue.append(nb)
+        return component
+
+    def _assign_cluster_labels(self):
+        """
+        Add a 'cluster_label' to self.df, with the ID for each connected component.
+        """
         self.df["cluster_label"] = self.df.index.map(self.clusters)
-
-        # Assign unique cluster labels to nodes not in the graph
+        # For any rows not in self.graph, assign unique cluster IDs
         unclustered = self.df["cluster_label"].isna()
-        self.df.loc[unclustered, "cluster_label"] = range(
-            max(self.clusters.values(), default=-1) + 1,
-            max(self.clusters.values(), default=-1) + 1 + unclustered.sum(),
-        )
+        if unclustered.any():
+            start = (max(self.clusters.values()) + 1) if self.clusters else 0
+            self.df.loc[unclustered, "cluster_label"] = range(
+                start, start + unclustered.sum()
+            )
 
     def cluster_data(self):
         """
-        Main method to cluster data.
+        Main entry point:
+         1) Build the final set of edges from the nested conditions
+         2) Construct the graph
+         3) Find connected components (clusters)
+         4) Assign cluster labels
         """
-        # Step 1: Create similarity matrices
-        self.create_similarity_matrices()
-        # pdb.set_trace()
-        # Step 2: Construct similarity graph
-        self._construct_similarity_graph()
+        # 1) Compute all edges from the nested conditions
+        final_edges = self._compute_edges_for_condition(self.conditions)
 
-        # Step 3: Find clusters from the graph
+        # 2) Build the graph
+        for id1, id2 in final_edges:
+            self.graph[id1].add(id2)
+            self.graph[id2].add(id1)
+
+        # 3) Find clusters
         self._find_clusters_from_graph()
 
-        # Step 4: Assign cluster labels
-        self.assign_cluster_labels()
-        pdb.set_trace()
+        # 4) Assign cluster labels
+        self._assign_cluster_labels()
+
         return self.df
+
+    def _compute_edges_for_condition(self, condition):
+        """
+        Recursively compute a set of edges that match the given condition structure.
+
+        The condition can be:
+          - A dict with key "and" -> list of sub-conditions
+          - A dict with key "or"  -> list of sub-conditions
+          - A dict representing one or more column thresholds (leaf condition)
+
+        Returns:
+            set of (id1, id2) pairs
+        """
+        if "and" in condition:
+            # condition["and"] is a list of sub-conditions
+            sub_conditions = condition["and"]
+            # We'll compute edges for each sub-condition and intersect them
+            edges_list = []
+            for sub_cond in sub_conditions:
+                edges_list.append(self._compute_edges_for_condition(sub_cond))
+            # Intersection
+            return set.intersection(*edges_list) if edges_list else set()
+
+        elif "or" in condition:
+            # condition["or"] is a list of sub-conditions
+            sub_conditions = condition["or"]
+            # We'll compute edges for each sub-condition and union them
+            edges_list = []
+            for sub_cond in sub_conditions:
+                edges_list.append(self._compute_edges_for_condition(sub_cond))
+            # Union
+            return set.union(*edges_list) if edges_list else set()
+
+        else:
+            # We assume it's a "leaf" dictionary specifying one or more columns
+            # Example:
+            # {
+            #   "BorrowerName": { ...params... },
+            #   "BorrowerAddress": { ...params... }
+            # }
+            # We can either interpret multiple columns in the same dictionary as AND logic,
+            # or treat each key as a separate sub-condition. Typically, you'd do AND here:
+            edges_list = []
+            for col_name, params in condition.items():
+                edges_for_col = self._compute_edges_for_single_column(col_name, params)
+                edges_list.append(edges_for_col)
+
+            # Combine them (AND) or (OR). Let's do AND by default here:
+            return set.intersection(*edges_list) if edges_list else set()
+
+    def _compute_edges_for_single_column(self, column, params):
+        """
+        Compute all pairs (id1, id2) that meet the threshold for one column + similarity method + blocking
+        """
+        # Extract parameters
+        threshold = params["threshold"]
+        similarity_method = params.get("similarity_method", "tfidf")
+        # blocking_criteria = params.get("blocking_criteria", [])
+        # blocking_columns = params.get("blocking_column", None)
+
+        # 1) Break dataframe into groups according to blocking
+        groups = list(
+            self.data_grouper.group_dataframe(params, column)
+        )  # see DataGrouper below
+
+        all_pairs = set()
+        for group in groups:
+            if len(group) <= 1:
+                continue
+
+            # 2) Vectorize / compute similarity within this group
+            group_data = self.similarity_calculator.initialize_vectorizer(
+                similarity_method, group[column]
+            )
+            # 3) Build adjacency list from threshold
+            similarity_arr = self.similarity_calculator.create_similarity_matrix(
+                group_data, group.index, column, threshold, similarity_method
+            )
+            # similarity_arr is Nx3: [id1, id2, sim]
+            for id1, id2, sim in similarity_arr:
+                # Build pairs in canonical order
+                if id1 > id2:
+                    id1, id2 = id2, id1
+                all_pairs.add((id1, id2))
+
+        return all_pairs
 
 
 class SimilarityCalculator:
-
     def initialize_vectorizer(self, similarity_method, data_column):
-        """
-        Initialize the vectorizer and transform the data based on the similarity method.
-
-        Args:
-            similarity_method (str): The similarity method to use ('tfidf', 'numeric', or 'exact').
-            data_column (pd.Series): The column of data to vectorize.
-
-        Returns:
-            scipy.sparse matrix or pd.Series: The vectorized data or raw data for exact matching.
-        """
         if similarity_method == "numeric":
-            # Numeric similarity: tokenizes numbers from the text
             vectorizer = TfidfVectorizer(
-                tokenizer=lambda x: re.findall(r"\d+", x),  # Extract numeric tokens
+                tokenizer=lambda x: re.findall(r"\d+", x),
                 preprocessor=None,
                 lowercase=False,
-                # stop_words="english",
             )
             return vectorizer.fit_transform(data_column.values)
-
         elif similarity_method == "tfidf":
-            # TF-IDF similarity: character n-grams
             vectorizer = TfidfVectorizer(
                 analyzer="char_wb",
                 preprocessor=None,
                 lowercase=True,
-                ngram_range=(2, 3),  # Bi- and tri-grams
+                ngram_range=(2, 3),
                 norm="l2",
                 smooth_idf=True,
                 use_idf=True,
                 stop_words="english",
             )
             return vectorizer.fit_transform(data_column.values)
-
         elif similarity_method == "exact":
-            # Exact similarity: raw data (no vectorization)
-            return data_column  # Return the column directly
-
+            # No vectorization needed, handle separately
+            return data_column
         else:
             raise ValueError(f"Unsupported similarity method: {similarity_method}")
 
@@ -238,9 +308,10 @@ class SimilarityCalculator:
     ):
         if similarity_method == "exact":
             return self._create_exact_match_matrix(group_tfidf, group_ids, column_name)
-        return self._create_cosine_similarity_matrix(
-            group_tfidf, group_ids, column_name, threshold
-        )
+        else:
+            return self._create_cosine_similarity_matrix(
+                group_tfidf, group_ids, column_name, threshold
+            )
 
     def _create_exact_match_matrix(self, group_tfidf, group_ids, column_name):
         # Logic for exact matching similarity matrix
@@ -249,65 +320,41 @@ class SimilarityCalculator:
     def _create_cosine_similarity_matrix(
         self, group_tfidf, group_ids, column_name, threshold
     ):
-        """
-        Create a cosine similarity matrix using `sparse_dot_topn` for large groups
-        and the original setup for small groups, without progress bars.
-        """
         n_samples = group_tfidf.shape[0]
         chunk_size = 2000
-        large_group_threshold = 500  # Use sparse_dot_topn for groups larger than this
+        large_group_threshold = 500
 
         if n_samples > large_group_threshold:
-            top_n = 100  # retain top-N similarities
-
+            top_n = 100
             cos_sim_sparse = sp_matmul_topn(
                 group_tfidf, group_tfidf, top_n=top_n, threshold=threshold, n_threads=-1
             )
-        # Use the original setup for small groups
         else:
             cos_sim_sparse = lil_matrix((n_samples, n_samples), dtype=np.float32)
-
             for start_idx in range(0, n_samples, chunk_size):
                 end_idx = min(start_idx + chunk_size, n_samples)
-                chunk_matrix = self._compute_cosine_similarity_chunk(
-                    start_idx, end_idx, group_tfidf, threshold
+                chunk_matrix = cosine_similarity(
+                    group_tfidf[start_idx:end_idx], group_tfidf
                 )
+                # Filter by threshold
+                mask = chunk_matrix >= threshold
+                chunk_matrix = np.where(mask, chunk_matrix, 0)
                 cos_sim_sparse[start_idx:end_idx, :] = chunk_matrix
 
         return self._finalize_similarity_matrix(cos_sim_sparse, group_ids, column_name)
 
-    def _compute_cosine_similarity_chunk(
-        self, start_idx, end_idx, group_tfidf, threshold
-    ):
-        chunk_matrix = cosine_similarity(group_tfidf[start_idx:end_idx], group_tfidf)
-        mask = chunk_matrix >= threshold
-        return np.where(mask, chunk_matrix, 0)
-
     def _finalize_similarity_matrix(self, cos_sim_sparse, group_ids, column_name):
-        """
-        Finalize the similarity matrix by filtering out self-similarities
-        and converting to a lightweight format.
-        """
-        coo = coo_matrix(cos_sim_sparse)
-        rows, cols, values = coo.row, coo.col, coo.data
+        coo_ = coo_matrix(cos_sim_sparse)
+        rows, cols, vals = coo_.row, coo_.col, coo_.data
 
-        # Filter out self-similarities
         mask = rows != cols
-        filtered_rows = rows[mask]
-        filtered_cols = cols[mask]
-        filtered_values = values[mask]
+        rows = rows[mask]
+        cols = cols[mask]
+        vals = vals[mask]
 
-        # Construct NumPy array
-        group_ids = np.array(group_ids)
-        similarities = np.vstack(
-            (
-                group_ids[filtered_rows],
-                group_ids[filtered_cols],
-                filtered_values,
-            )
-        ).T
-
-        return similarities  # Return as NumPy array
+        group_ids_arr = np.array(group_ids)
+        similarities = np.vstack((group_ids_arr[rows], group_ids_arr[cols], vals)).T
+        return similarities
 
 
 class DataGrouper:
@@ -315,47 +362,74 @@ class DataGrouper:
         self.df = df
 
     def group_dataframe(self, params, column):
-        df = self._preprocess_column(column)
+        df_filtered = self._preprocess_column(column)
         blocking_criteria = params.get("blocking_criteria", None)
 
         if not blocking_criteria:
-            return [(None, df)]
+            # Return the entire DF as one group
+            return [df_filtered]
 
-        grouped_data = [df]
+        # Otherwise, apply each criterion in sequence
+        grouped_data = [df_filtered]
         for criterion in blocking_criteria:
             grouped_data = self._apply_blocking_criterion(
                 grouped_data, criterion, params, column
             )
-        return grouped_data
+
+        # grouped_data is a list of (group_key, sub_df) or just sub_dfs:
+        # If we want only sub_dfs, we can strip out the group_key.
+        final_groups = []
+        for item in grouped_data:
+            if isinstance(item, tuple):
+                # item is (group_key, sub_df)
+                if len(item[1]) > 1:
+                    final_groups.append(item[1])
+            else:
+                # item is sub_df
+                if len(item) > 1:
+                    final_groups.append(item)
+        return final_groups
 
     def _preprocess_column(self, column):
         return self.df[
             (self.df[column].notnull())
             & (self.df[column] != "")
-            & (self.df[column].str.lower().isin(["unknown", "nan", "none"]) == False)
+            & ~(self.df[column].str.lower().isin(["unknown", "nan", "none"]))
         ]
 
     def _apply_blocking_criterion(self, grouped_data, criterion, params, column):
         new_groups = []
         for group in grouped_data:
+            if isinstance(group, tuple):
+                # (key, df) pattern
+                group = group[1]
+            if group.empty:
+                continue
+
             if criterion == "first_letter":
-                # Group by the first letter of the column
+                # group by first letter of the column
                 new_groups.extend(list(group.groupby(group[column].str[0], sort=False)))
             elif criterion == "blocking_column":
-                blocking_columns = params.get("blocking_column")
-                if isinstance(blocking_columns, list):
-                    # Group by multiple columns
-                    new_groups.extend(list(group.groupby(blocking_columns, sort=False)))
-                elif isinstance(blocking_columns, str):
-                    # Group by a single column
-                    new_groups.extend(list(group.groupby(blocking_columns, sort=False)))
+                blocking_cols = params.get("blocking_column")
+                if not blocking_cols:
+                    new_groups.append((None, group))
+                    continue
+                if isinstance(blocking_cols, str):
+                    new_groups.extend(list(group.groupby(blocking_cols, sort=False)))
+                elif isinstance(blocking_cols, list):
+                    new_groups.extend(list(group.groupby(blocking_cols, sort=False)))
                 else:
-                    raise ValueError(
-                        f"Invalid blocking_columns type: {type(blocking_columns)}"
-                    )
+                    raise ValueError("Invalid blocking_column type.")
             else:
                 raise ValueError(f"Unsupported blocking criterion: {criterion}")
-        return [grp for _, grp in new_groups if len(grp) > 1]
+
+        # Filter out single-row groups
+        filtered_groups = []
+        for grp in new_groups:
+            key, subdf = grp
+            if len(subdf) > 1:
+                filtered_groups.append(grp)
+        return filtered_groups
 
 
 class TwoDFMatcher:
@@ -371,113 +445,187 @@ class TwoDFMatcher:
     #     """
     #     self.tfidf_min_value = tfidf_min_value
 
-    def match_two_dataframes_blocking(
+    def match_two_dataframes_blocking_conditions(
         self,
         df1,
         df2,
-        column_thresholds,
+        conditions,  # <-- This replaces the old 'column_thresholds'
         top_n=1,
         global_threshold=0.0,
-        combine_method="OR",
     ):
         """
-        Main method to match two DataFrames using per-column thresholds and blocking criteria.
+        Main entry point for nested AND/OR logic.
 
         Args:
-            df1 (pd.DataFrame): First DataFrame
-            df2 (pd.DataFrame): Second DataFrame
-            column_thresholds (dict): A dict like:
+            df1 (pd.DataFrame)
+            df2 (pd.DataFrame)
+            conditions (dict): A nested dict specifying AND/OR logic, for example:
                 {
-                  "BorrowerName": {
-                    "threshold": 0.9,
-                    "similarity_method": "tfidf",
-                    "blocking_criteria": ["blocking_column"],
-                    "blocking_column": ["BorrowerCity"],
-                  },
-                  "BorrowerAddress": {
-                    "threshold": 0.8,
-                    "similarity_method": "tfidf",
-                    "blocking_criteria": ["first_letter"],
-                  },
-                  ...
+                    "or": [
+                        {
+                            "and": [
+                                {
+                                    "BorrowerName": {
+                                        "threshold": 0.6,
+                                        "similarity_method": "tfidf",
+                                        "blocking_column": ["BorrowerCity"],
+                                        "blocking_criteria": ["blocking_column"]
+                                    }
+                                },
+                                {
+                                    "BorrowerAddress": {
+                                        "threshold": 0.9,
+                                        "similarity_method": "tfidf",
+                                        "blocking_column": ["BorrowerCity"],
+                                        "blocking_criteria": ["blocking_column"]
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            # Another sub-condition (leaf)
+                            "BorrowerName": {
+                                "threshold": 0.95,
+                                "similarity_method": "tfidf",
+                                "blocking_criteria": []
+                            }
+                        }
+                    ]
                 }
-            top_n (int): Number of top matches to retain per row within each block.
-            global_threshold (float): If > 0, a final similarity cutoff to apply after combining columns.
-            combine_method (str): "OR" or "AND" to combine matches across columns.
+            top_n (int): how many top matches to keep for each row in each block
+            global_threshold (float): final filter for similarity scores if needed
 
         Returns:
-            pd.DataFrame: Combined matches with columns [df1_index, df2_index, similarity_score, column]
+            pd.DataFrame with columns [df1_index, df2_index, max_similarity_score]
         """
-        all_matches_by_column = []
+        # final_dict = { (df1_idx, df2_idx) -> { "BorrowerName": sim, "BorrowerAddress": sim, ... } }
+        final_dict = self._compute_matches_for_condition(conditions, df1, df2, top_n)
 
-        # Wrap columns iteration in a progress bar:
-        for col_name, params in tqdm(
-            column_thresholds.items(), desc="Processing columns"
-        ):
-            threshold = params["threshold"]
-            similarity_method = params.get("similarity_method", "tfidf")
-            blocking_criteria = params.get("blocking_criteria", [])
+        # Convert that to a DataFrame with one column per matched column:
+        rows = []
+        for (idx1, idx2), col_scores in final_dict.items():
+            row_data = {
+                "df1_index": idx1,
+                "df2_index": idx2,
+            }
 
-            # Generate block pairs
-            block_pairs = list(
-                self._generate_block_pairs(
-                    df1, df2, col_name, blocking_criteria, params
+            for col, score in col_scores.items():
+                row_data[col + "_sim"] = score
+            rows.append(row_data)
+
+        df_result = pd.DataFrame(rows)
+        return df_result
+
+    def _compute_matches_for_condition(self, condition, df1, df2, top_n):
+        """
+        Return a dict: (idx1, idx2) -> { "columnA": simA, "columnB": simB, ... }
+        """
+        if "and" in condition:
+            dicts = []
+            for sub_cond in condition["and"]:
+                sub_dict = self._compute_matches_for_condition(
+                    sub_cond, df1, df2, top_n
                 )
-            )
-            column_matches = []
+                dicts.append(sub_dict)
+            if not dicts:
+                return {}
+            # Intersect keys, merge column-similarity
+            return self._intersect_match_dicts(dicts)
 
-            # Wrap block pairs in an inner progress bar
-            for sub_df1, sub_df2 in tqdm(
-                block_pairs, desc=f"Blocks for {col_name}", leave=False
-            ):
-                if sub_df1.empty or sub_df2.empty:
-                    continue
-
-                block_result_df = self._match_subdataframes(
-                    sub_df1, sub_df2, col_name, similarity_method, threshold, top_n
+        elif "or" in condition:
+            dicts = []
+            for sub_cond in condition["or"]:
+                sub_dict = self._compute_matches_for_condition(
+                    sub_cond, df1, df2, top_n
                 )
+                dicts.append(sub_dict)
+            if not dicts:
+                return {}
+            # Union keys, merge column-similarity
+            return self._union_match_dicts(dicts)
 
-                if not block_result_df.empty:
-                    block_result_df["column"] = col_name
-                    column_matches.append(block_result_df)
+        else:
+            return self._compute_matches_for_leaf(condition, df1, df2, top_n)
 
-            if column_matches:
-                column_df = pd.concat(column_matches, ignore_index=True)
-                all_matches_by_column.append(column_df)
-
-        # Combine results across columns, apply AND/OR logic, etc. (same as before)
-        if not all_matches_by_column:
-            return pd.DataFrame(
-                columns=["df1_index", "df2_index", "similarity_score", "column"]
+    def _compute_matches_for_leaf(self, leaf_dict, df1, df2, top_n):
+        """
+        If the leaf has multiple columns, treat them with an AND by default,
+        meaning a pair must pass all column thresholds.
+        """
+        all_columns_dicts = []
+        for col_name, params in leaf_dict.items():
+            col_dict = self._compute_matches_for_single_column(
+                df1, df2, col_name, params, top_n
             )
+            # col_dict is: (idx1, idx2) -> { col_name: similarity }
+            all_columns_dicts.append(col_dict)
 
-        combined_df = pd.concat(all_matches_by_column, ignore_index=True)
+        if not all_columns_dicts:
+            return {}
+        # Intersect them, because a leaf with multiple columns typically means "AND"
+        return self._intersect_match_dicts(all_columns_dicts)
 
-        if combine_method == "AND":
-            group_cols = ["df1_index", "df2_index"]
-            pair_counts = (
-                combined_df.groupby(group_cols)["column"].nunique().reset_index()
+    def _compute_matches_for_single_column(self, df1, df2, column, params, top_n):
+        """
+        Return a dict { (df1_idx, df2_idx): { column: similarity } }
+        """
+        threshold = params.get("threshold", 0.8)
+        sim_method = params.get("similarity_method", "tfidf")
+        blocking_criteria = params.get("blocking_criteria", [])
+
+        # 1) blocking
+        block_pairs = list(
+            self._generate_block_pairs(df1, df2, column, blocking_criteria, params)
+        )
+        out = {}
+        # Wrap block_pairs in a tqdm loop
+        for sub_df1, sub_df2 in tqdm(block_pairs, desc=f"Block pairs for {column}"):
+            if sub_df1.empty or sub_df2.empty:
+                continue
+            block_result_df = self._match_subdataframes(
+                sub_df1, sub_df2, column, sim_method, threshold, top_n
             )
-            n_columns = len(column_thresholds)
-            valid_pairs = pair_counts[pair_counts["column"] == n_columns]
-            combined_df = combined_df.merge(
-                valid_pairs[group_cols], on=group_cols, how="inner"
-            )
+            # block_result_df: df1_index, df2_index, similarity_score
+            for row in block_result_df.itertuples():
+                pair = (row.df1_index, row.df2_index)
+                out[pair] = {column: row.similarity_score}
+        return out
 
-        if global_threshold > 0:
-            combined_df = combined_df[
-                combined_df["similarity_score"] >= global_threshold
-            ]
+    def _intersect_match_dicts(self, dict_list):
+        """
+        Intersect the keys across all dicts. Then merge column-sim values.
+        """
+        if not dict_list:
+            return {}
+        # Start from the first dict
+        common_keys = set(dict_list[0].keys())
+        for d in dict_list[1:]:
+            common_keys &= set(d.keys())
+        # For each key in common_keys, we merge the column-sim maps
+        out = {}
+        for k in common_keys:
+            merged_cols = {}
+            for d in dict_list:
+                merged_cols.update(d[k])  # merges the {col:sim} from each dict
+            out[k] = merged_cols
+        return out
 
-        return combined_df
+    def _union_match_dicts(self, dict_list):
+        """
+        Union the keys across all dicts, merging col-sim maps for pairs that appear in multiple.
+        """
+        out = {}
+        for d in dict_list:
+            for k, colmap in d.items():
+                if k not in out:
+                    out[k] = dict(colmap)  # copy
+                else:
+                    # merge
+                    out[k].update(colmap)
+        return out
 
     def _generate_block_pairs(self, df1, df2, col_name, blocking_criteria, params):
-        """
-        Produce (sub_df1, sub_df2) pairs that share the same blocking key(s),
-        according to the blocking criteria for this column.
-
-        If no blocking criteria, we yield the entire (df1, df2).
-        """
+        # as before ...
         if not blocking_criteria:
             yield (df1, df2)
             return
@@ -485,8 +633,6 @@ class TwoDFMatcher:
         new_groups_1 = [df1]
         new_groups_2 = [df2]
 
-        # If there's a chain of criteria (e.g. ["blocking_column", "first_letter"]),
-        # apply them in sequence.
         for criterion in blocking_criteria:
             tmp_groups_1 = []
             for gdf1 in new_groups_1:
@@ -503,54 +649,29 @@ class TwoDFMatcher:
             new_groups_1 = tmp_groups_1
             new_groups_2 = tmp_groups_2
 
-        # Now we have lists of grouped sub-dataframes for df1 and df2.
-        # We need to match sub-dataframes that share the same group key(s).
-        # We'll build a dictionary keyed by each group's name or first row's grouping key, etc.
+        # Now match blocks by key
+        dict1 = self._grouped_to_dict(new_groups_1)
+        dict2 = self._grouped_to_dict(new_groups_2)
 
-        def group_by_block_id(group_list):
-            """
-            group_list is a list of (group_key, sub_df).
-            group_key can be a single value or tuple if we grouped by multiple columns.
-            We'll store them in a dict to match keys across df1 and df2.
-            """
-            result = {}
-            for block_key, gdf in group_list:
-                result[block_key] = gdf
-            return result
-
-        # But note that _apply_blocking_criterion returns a list of (key, sub_df).
-        # If your code returns only sub_dfs, adapt accordingly.
-
-        if isinstance(new_groups_1[0], tuple):
-            dict1 = group_by_block_id(new_groups_1)
-        else:
-            # If your code returns just sub_dfs, no keys. Then you need a different approach:
-            # For now, assume we have (key, sub_df).
-            dict1 = {i: g for i, g in enumerate(new_groups_1)}
-
-        if isinstance(new_groups_2[0], tuple):
-            dict2 = group_by_block_id(new_groups_2)
-        else:
-            dict2 = {i: g for i, g in enumerate(new_groups_2)}
-
-        # Match keys that appear in both
         for block_key, sub1 in dict1.items():
             if block_key in dict2:
                 sub2 = dict2[block_key]
                 yield (sub1, sub2)
 
-    def _apply_blocking_criterion(self, df, criterion, params, col_name):
-        """
-        Example from your DataGrouper:
-            - 'first_letter': group by first letter of column
-            - 'blocking_column': group by one or more columns
-        Return a list of (group_key, sub_df).
-        """
-        if criterion == "first_letter":
-            # Group by the first letter of the col_name
-            grouped = df.groupby(df[col_name].astype(str).str[0], dropna=False)
-            return list(grouped)  # each item is (group_key, sub_df)
+    def _grouped_to_dict(self, group_list):
+        # group_list is a list of (key, dataframe)
+        # convert to dict
+        out = {}
+        for key, df_ in group_list:
+            out[key] = df_
+        return out
 
+    def _apply_blocking_criterion(self, df, criterion, params, col_name):
+        # as before ...
+        df = df.copy()
+        if criterion == "first_letter":
+            grouped = df.groupby(df[col_name].astype(str).str[0], dropna=False)
+            return list(grouped)
         elif criterion == "blocking_column":
             blocking_columns = params.get("blocking_column")
             if isinstance(blocking_columns, list):
@@ -562,52 +683,36 @@ class TwoDFMatcher:
                 grouped = df.groupby(blocking_columns, dropna=False)
                 return list(grouped)
             else:
-                raise ValueError(f"Invalid blocking_columns: {blocking_columns}")
-
+                # Previously, maybe you had "pass" or no return statement
+                # This leads to returning None, causing the error.
+                # We must return SOMETHING (like an empty list or a single group).
+                return [(None, df)]
         else:
             raise ValueError(f"Unsupported blocking criterion: {criterion}")
 
     def _match_subdataframes(
         self, sub_df1, sub_df2, col_name, similarity_method, threshold, top_n
     ):
-        """
-        For the given sub-dataframes that share a blocking key,
-        compute top-n similarities above threshold on col_name.
-        Returns a DataFrame [df1_index, df2_index, similarity_score].
-        """
-        # Build & fit a TfidfVectorizer on combined text
+        # same logic you already have:
         vectorizer = self._create_vectorizer(similarity_method)
-
         combined_text = pd.concat([sub_df1[col_name], sub_df2[col_name]]).astype(str)
         vectorizer.fit(combined_text)
 
         tfidf_a = vectorizer.transform(sub_df1[col_name].astype(str))
         tfidf_b = vectorizer.transform(sub_df2[col_name].astype(str))
 
-        # Optional pruning
-        # if similarity_method in ("tfidf", "numeric") and self.tfidf_min_value > 0:
-        #     tfidf_a = self._prune_tfidf_matrix(tfidf_a)
-        #     tfidf_b = self._prune_tfidf_matrix(tfidf_b)
-
-        # Sparse dot product top-n
         results_sparse = sp_matmul_topn(
             tfidf_a, tfidf_b.T, top_n=top_n, threshold=threshold, n_threads=-1
         )
-        result_df = self._sparse_results_to_df(
-            results_sparse, sub_df1.index, sub_df2.index
-        )
-        return result_df
+        return self._sparse_results_to_df(results_sparse, sub_df1.index, sub_df2.index)
 
     def _create_vectorizer(self, similarity_method):
-        """
-        Creates and returns a TfidfVectorizer (not the final matrix) based on the method.
-        """
+        # same as your code
         if similarity_method == "numeric":
             return TfidfVectorizer(
                 tokenizer=lambda x: re.findall(r"\d+", x),
                 preprocessor=None,
                 lowercase=False,
-                # stop_words="english",
             )
         elif similarity_method == "tfidf":
             return TfidfVectorizer(
@@ -618,16 +723,11 @@ class TwoDFMatcher:
                 norm="l2",
                 smooth_idf=True,
                 use_idf=True,
-                # stop_words="english",
             )
         else:
             raise ValueError(f"Unsupported similarity method: {similarity_method}")
 
     def _sparse_results_to_df(self, sparse_matrix, index_a, index_b):
-        """
-        Convert a sparse (n_rows_a x n_rows_b) matrix of dot products
-        to a DataFrame: [df1_index, df2_index, similarity_score].
-        """
         coo = sparse_matrix.tocoo()
         rows, cols, data = coo.row, coo.col, coo.data
 
@@ -643,65 +743,66 @@ class TwoDFMatcher:
         )
         return result_df
 
-    def _prune_tfidf_matrix(self, tfidf_matrix):
-        """
-        If self.tfidf_min_value > 0, zero out entries below that and re-sparsify.
-        """
-        mask = tfidf_matrix.data < self.tfidf_min_value
-        tfidf_matrix.data[mask] = 0
-        tfidf_matrix.eliminate_zeros()
-        return tfidf_matrix
-
 
 if __name__ == "__main__":
-    df = pd.read_csv("test_data/100k.csv", nrows=500_000, encoding="latin-1")
+    df = pd.read_csv("test_data/100k.csv", nrows=1_000_000, encoding="latin-1")
+    # pdb.set_trace()
     df = df[["BorrowerName", "BorrowerAddress", "BorrowerCity"]]
     df.reset_index(inplace=True)
-    df1 = df.iloc[:25_000]
-    df2 = df.iloc[25_000:100_000]
 
-    column_thresholds = {
-        "BorrowerName": {
-            "threshold": 0.8,
-            "blocking_column": ["BorrowerCity"],
-            "blocking_criteria": ["blocking_column"],
-            "similarity_method": "tfidf",
-        },
-        "BorrowerAddress": {
-            "threshold": 0.9,
-            "blocking_column": ["BorrowerCity"],
-            "blocking_criteria": ["blocking_column"],
-            "similarity_method": "tfidf",
-        },
+    my_conditions = {
+        "or": [
+            {
+                "and": [
+                    {
+                        "BorrowerName": {
+                            "threshold": 0.4,
+                            "blocking_column": ["BorrowerCity"],
+                            "blocking_criteria": ["blocking_column"],
+                            "similarity_method": "tfidf",
+                        }
+                    },
+                    {
+                        "BorrowerAddress": {
+                            "threshold": 0.9,
+                            "blocking_column": ["BorrowerCity"],
+                            "blocking_criteria": ["blocking_column"],
+                            "similarity_method": "tfidf",
+                        }
+                    },
+                ]
+            },
+            {
+                "BorrowerName": {
+                    "threshold": 0.75,
+                    "blocking_column": ["BorrowerCity"],
+                    "blocking_criteria": ["blocking_column"],
+                    "similarity_method": "tfidf",
+                }
+            },
+        ]
     }
 
-    matcher = TwoDFMatcher()
+    # smg = SimilarityMatrixGenerator(df, my_conditions)
+    # df_result = smg.cluster_data()
+    # # pdb.set_trace()
 
+    df1 = df.iloc[:100_000]
+    df2 = df.iloc[100_000:1_000_000]
+
+    matcher = TwoDFMatcher()
+    # pdb.set_trace()
     # Let's keep top 3 matches per row, apply a final global threshold if needed
-    results = matcher.match_two_dataframes_blocking(
+    results = matcher.match_two_dataframes_blocking_conditions(
         df1=df1,
         df2=df2,
-        column_thresholds=column_thresholds,
+        conditions=my_conditions,
         top_n=3,
         global_threshold=0.0,
-        combine_method="OR",
     )
+    # pdb.set_trace()
 
-    print("----- MATCHING RESULTS -----")
-    print(results)
-
-    pivoted = results.pivot_table(
-        index=["df1_index", "df2_index"], columns="column", values="similarity_score"
-    ).reset_index()
-
-    pivoted.rename(
-        columns=lambda c: (
-            f"similarity_{c}" if c not in ["df1_index", "df2_index"] else c
-        ),
-        inplace=True,
-    )
-
-    merged = pivoted.merge(
+    merged = results.merge(
         df1, left_on="df1_index", right_index=True, how="left"
     ).merge(
         df2,
