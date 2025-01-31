@@ -5,20 +5,28 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 from tqdm import tqdm
 import pdb
+from collections import defaultdict
+import numpy as np
 import re
 from collections import defaultdict, deque
 from sparse_dot_topn import awesome_cossim_topn, sp_matmul_topn
+from itertools import combinations
 
 
 class SimilarityMatrixGenerator:
-    def __init__(self, df, conditions):
+    def __init__(self, df, conditions, must_links=None, cannot_links=None):
         """
         Args:
             df (pd.DataFrame): The DataFrame to cluster
-            conditions (dict): A nested dictionary specifying the AND/OR logic
+            conditions (dict): Nested dictionary specifying AND/OR logic
+            must_links (set of tuples): Pairs (id1, id2) that must be clustered together
+            cannot_links (set of tuples): Pairs (id1, id2) that must NOT be in same cluster
         """
         self.df = df
         self.conditions = conditions
+        self.must_links = must_links if must_links else set()
+        self.cannot_links = cannot_links if cannot_links else set()
+
         self.graph = defaultdict(set)
         self.clusters = {}
         self.similarity_calculator = SimilarityCalculator()
@@ -165,29 +173,83 @@ class SimilarityMatrixGenerator:
                 start, start + unclustered.sum()
             )
 
-    def cluster_data(self):
-        """
-        Main entry point:
-         1) Build the final set of edges from the nested conditions
-         2) Construct the graph
-         3) Find connected components (clusters)
-         4) Assign cluster labels
-        """
-        # 1) Compute all edges from the nested conditions
+    def cluster_data(self, old_label_map=None):
+        # 1) If old_label_map is provided, inject must-link edges among them
+        if old_label_map is not None:
+            from itertools import combinations
+
+            label_groups = defaultdict(list)
+            for node, lbl in old_label_map.items():
+                label_groups[lbl].append(node)
+            for lbl, node_list in label_groups.items():
+                for a, b in combinations(node_list, 2):
+                    if a > b:
+                        a, b = b, a
+                    self.must_links.add((a, b))
+
+        # 2) Compute all edges from the nested conditions
         final_edges = self._compute_edges_for_condition(self.conditions)
 
-        # 2) Build the graph
+        # 3) Force-add must_link edges and remove cannot_link edges
+        for a, b in self.must_links:
+            if a > b:
+                a, b = b, a
+            final_edges.add((a, b))
+        for a, b in self.cannot_links:
+            if a > b:
+                a, b = b, a
+            if (a, b) in final_edges:
+                final_edges.remove((a, b))
+
+        # 4) Build the graph from final_edges
         for id1, id2 in final_edges:
             self.graph[id1].add(id2)
             self.graph[id2].add(id1)
 
-        # 3) Find clusters
+        # 5) Find clusters using BFS
         self._find_clusters_from_graph()
 
-        # 4) Assign cluster labels
-        self._assign_cluster_labels()
+        # 6) Final label assignment: if an old_label_map is provided, derive final labels to preserve verified clusters;
+        #    otherwise, assign labels normally.
+        if old_label_map is not None:
+            node_to_label = self._derive_final_labels_with_old(
+                self.clusters, old_label_map
+            )
+            self.df["cluster_label"] = self.df.index.map(node_to_label)
+        else:
+            self._assign_cluster_labels()
 
         return self.df
+
+    def _derive_final_labels_with_old(self, clusters, old_label_map):
+        """
+        clusters: dict node -> component_id
+        old_label_map: dict node -> old_label (like 'master_1')
+        """
+        comp_to_nodes = defaultdict(list)
+        for node, comp_id in clusters.items():
+            comp_to_nodes[comp_id].append(node)
+
+        final_label_map = {}
+        for comp_id, node_list in comp_to_nodes.items():
+            old_labels_in_this_comp = set()
+            for n in node_list:
+                if n in old_label_map:
+                    old_labels_in_this_comp.add(old_label_map[n])
+            if len(old_labels_in_this_comp) == 1:
+                final_label_map[comp_id] = list(old_labels_in_this_comp)[0]
+            elif len(old_labels_in_this_comp) > 1:
+                # multiple old clusters got merged
+                merged_label = "_".join(sorted(old_labels_in_this_comp))
+                final_label_map[comp_id] = merged_label
+            else:
+                # brand new
+                final_label_map[comp_id] = f"new_{comp_id}"
+
+        node_to_label = {}
+        for node, comp_id in clusters.items():
+            node_to_label[node] = final_label_map[comp_id]
+        return node_to_label
 
     def _compute_edges_for_condition(self, condition):
         """
@@ -243,8 +305,10 @@ class SimilarityMatrixGenerator:
         Compute all pairs (id1, id2) that meet the threshold for one column + similarity method + blocking
         """
         # Extract parameters
-        threshold = params["threshold"]
+        threshold = params.get("threshold", 0.8)
         similarity_method = params.get("similarity_method", "tfidf")
+        if similarity_method == "exact":
+            threshold = 1.0
         # blocking_criteria = params.get("blocking_criteria", [])
         # blocking_columns = params.get("blocking_column", None)
 
@@ -254,7 +318,7 @@ class SimilarityMatrixGenerator:
         )  # see DataGrouper below
 
         all_pairs = set()
-        for group in groups:
+        for group in tqdm(groups, desc=f"Processing groups for column '{column}'"):
             if len(group) <= 1:
                 continue
 
@@ -262,10 +326,12 @@ class SimilarityMatrixGenerator:
             group_data = self.similarity_calculator.initialize_vectorizer(
                 similarity_method, group[column]
             )
+
             # 3) Build adjacency list from threshold
             similarity_arr = self.similarity_calculator.create_similarity_matrix(
                 group_data, group.index, column, threshold, similarity_method
             )
+            # pdb.set_trace()
             # similarity_arr is Nx3: [id1, id2, sim]
             for id1, id2, sim in similarity_arr:
                 # Build pairs in canonical order
@@ -298,7 +364,6 @@ class SimilarityCalculator:
             )
             return vectorizer.fit_transform(data_column.values)
         elif similarity_method == "exact":
-            # No vectorization needed, handle separately
             return data_column
         else:
             raise ValueError(f"Unsupported similarity method: {similarity_method}")
@@ -307,15 +372,49 @@ class SimilarityCalculator:
         self, group_tfidf, group_ids, column_name, threshold, similarity_method
     ):
         if similarity_method == "exact":
-            return self._create_exact_match_matrix(group_tfidf, group_ids, column_name)
+            return self._create_exact_match_matrix(group_tfidf, group_ids)
         else:
             return self._create_cosine_similarity_matrix(
                 group_tfidf, group_ids, column_name, threshold
             )
 
-    def _create_exact_match_matrix(self, group_tfidf, group_ids, column_name):
-        # Logic for exact matching similarity matrix
-        pass
+    def _create_exact_match_matrix(self, group_data, group_ids):
+        """
+        Build a similarity matrix for exact matching.
+        For each value in group_data, all rows that share that exact value
+        form pairs with similarity=1.0.
+
+        Args:
+            group_data (pd.Series): The raw text or values for 'exact' matching
+            group_ids (pd.Index or list): The row indices corresponding to group_data
+            column_name (str): Not strictly needed here, but included for consistency
+
+        Returns:
+            np.ndarray of shape (N, 3), each row = [id1, id2, 1.0]
+        """
+
+        # Map each unique exact value -> list of row indices
+        value_to_indices = defaultdict(list)
+        for idx, val in zip(group_ids, group_data):
+            value_to_indices[val].append(idx)
+
+        pairs = []
+        # For each exact value, form all unique pairs of indices
+        for val, idx_list in value_to_indices.items():
+            n = len(idx_list)
+            if n > 1:
+                # Generate pairwise combos among these indices
+                # (skip self-pairs, only do combinations i < j)
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        id1 = idx_list[i]
+                        id2 = idx_list[j]
+                        pairs.append((id1, id2, 1.0))
+
+        if len(pairs) == 0:
+            return np.zeros((0, 3), dtype=float)
+
+        return np.array(pairs, dtype=float)
 
     def _create_cosine_similarity_matrix(
         self, group_tfidf, group_ids, column_name, threshold
@@ -745,18 +844,22 @@ class TwoDFMatcher:
 
 
 if __name__ == "__main__":
-    df = pd.read_csv("test_data/100k.csv", nrows=1_000_000, encoding="latin-1")
+    df = pd.read_csv("test_data/100k.csv", nrows=100_000, encoding="latin-1")
     # pdb.set_trace()
     df = df[["BorrowerName", "BorrowerAddress", "BorrowerCity"]]
     df.reset_index(inplace=True)
 
+    old_label_map = {28600: "master_1", 28871: "master_1"}
+    df["cluster_label"] = None
+    df.loc[[28600, 28871], "cluster_label"] = [old_label_map[i] for i in [28600, 28871]]
+    # pdb.set_trace()
     my_conditions = {
         "or": [
             {
                 "and": [
                     {
                         "BorrowerName": {
-                            "threshold": 0.4,
+                            "threshold": 0.3,
                             "blocking_column": ["BorrowerCity"],
                             "blocking_criteria": ["blocking_column"],
                             "similarity_method": "tfidf",
@@ -774,58 +877,57 @@ if __name__ == "__main__":
             },
             {
                 "BorrowerName": {
-                    "threshold": 0.75,
                     "blocking_column": ["BorrowerCity"],
                     "blocking_criteria": ["blocking_column"],
-                    "similarity_method": "tfidf",
+                    "similarity_method": "exact",
                 }
             },
         ]
     }
 
-    # smg = SimilarityMatrixGenerator(df, my_conditions)
-    # df_result = smg.cluster_data()
-    # # pdb.set_trace()
+    smg = SimilarityMatrixGenerator(df, my_conditions)
+    df = smg.cluster_data(old_label_map=old_label_map)
+    pdb.set_trace()
 
-    df1 = df.iloc[:100_000]
-    df2 = df.iloc[100_000:1_000_000]
+    # df1 = df.iloc[:100_000]
+    # df2 = df.iloc[100_000:1_000_000]
 
-    matcher = TwoDFMatcher()
+    # matcher = TwoDFMatcher()
     # pdb.set_trace()
     # Let's keep top 3 matches per row, apply a final global threshold if needed
-    results = matcher.match_two_dataframes_blocking_conditions(
-        df1=df1,
-        df2=df2,
-        conditions=my_conditions,
-        top_n=3,
-        global_threshold=0.0,
-    )
+    # results = matcher.match_two_dataframes_blocking_conditions(
+    #     df1=df1,
+    #     df2=df2,
+    #     conditions=my_conditions,
+    #     top_n=3,
+    #     global_threshold=0.0,
+    # )
     # pdb.set_trace()
 
-    merged = results.merge(
-        df1, left_on="df1_index", right_index=True, how="left"
-    ).merge(
-        df2,
-        left_on="df2_index",
-        right_index=True,
-        how="left",
-        suffixes=("_df1", "_df2"),
-    )
-    pdb.set_trace()
-    column_thresholds = {
-        "BorrowerName": {
-            "threshold": 0.6,
-            "blocking_column": ["BorrowerCity"],
-            "blocking_criteria": ["blocking_column"],
-            "similarity_method": "tfidf",
-        },
-        "BorrowerAddress": {
-            "threshold": 0.9,
-            "blocking_column": ["BorrowerCity"],
-            "blocking_criteria": ["blocking_column"],
-            "similarity_method": "tfidf",
-        },
-    }
-    pdb.set_trace()
+    # merged = results.merge(
+    #     df1, left_on="df1_index", right_index=True, how="left"
+    # ).merge(
+    #     df2,
+    #     left_on="df2_index",
+    #     right_index=True,
+    #     how="left",
+    #     suffixes=("_df1", "_df2"),
+    # )
+    # pdb.set_trace()
+    # column_thresholds = {
+    #     "BorrowerName": {
+    #         "threshold": 0.6,
+    #         "blocking_column": ["BorrowerCity"],
+    #         "blocking_criteria": ["blocking_column"],
+    #         "similarity_method": "tfidf",
+    #     },
+    #     "BorrowerAddress": {
+    #         "threshold": 0.9,
+    #         "blocking_column": ["BorrowerCity"],
+    #         "blocking_criteria": ["blocking_column"],
+    #         "similarity_method": "tfidf",
+    #     },
+    # }
+    # pdb.set_trace()
     EF = SimilarityMatrixGenerator(df, column_thresholds, combine_method="AND")
     clustered_df = EF.cluster_data()
