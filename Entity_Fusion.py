@@ -14,7 +14,7 @@ from itertools import combinations
 
 
 class SimilarityMatrixGenerator:
-    def __init__(self, df, conditions, must_links=None, cannot_links=None):
+    def __init__(self, df, conditions, index=None, must_links=None, cannot_links=None):
         """
         Args:
             df (pd.DataFrame): The DataFrame to cluster
@@ -26,6 +26,8 @@ class SimilarityMatrixGenerator:
         self.conditions = conditions
         self.must_links = must_links if must_links else set()
         self.cannot_links = cannot_links if cannot_links else set()
+        if index is not None:
+            self.df.set_index(index, inplace=True)
 
         self.graph = defaultdict(set)
         self.clusters = {}
@@ -378,38 +380,27 @@ class SimilarityCalculator:
                 group_tfidf, group_ids, column_name, threshold
             )
 
-    def _create_exact_match_matrix(self, group_data, group_ids):
-        """
-        Build a similarity matrix for exact matching.
-        For each value in group_data, all rows that share that exact value
-        form pairs with similarity=1.0.
+    def _create_exact_match_matrix_optimized(self, group_data, group_ids):
+        from collections import defaultdict
+        import numpy as np
 
-        Args:
-            group_data (pd.Series): The raw text or values for 'exact' matching
-            group_ids (pd.Index or list): The row indices corresponding to group_data
-            column_name (str): Not strictly needed here, but included for consistency
-
-        Returns:
-            np.ndarray of shape (N, 3), each row = [id1, id2, 1.0]
-        """
-
-        # Map each unique exact value -> list of row indices
         value_to_indices = defaultdict(list)
         for idx, val in zip(group_ids, group_data):
             value_to_indices[val].append(idx)
 
         pairs = []
-        # For each exact value, form all unique pairs of indices
         for val, idx_list in value_to_indices.items():
             n = len(idx_list)
             if n > 1:
-                # Generate pairwise combos among these indices
-                # (skip self-pairs, only do combinations i < j)
-                for i in range(n):
-                    for j in range(i + 1, n):
-                        id1 = idx_list[i]
-                        id2 = idx_list[j]
-                        pairs.append((id1, id2, 1.0))
+                # Convert to a numpy array for vectorized operations.
+                idx_array = np.array(idx_list)
+                # Generate indices for the upper triangle (i < j).
+                i_idx, j_idx = np.triu_indices(n, k=1)
+                # Create the pairs all at once
+                # Note: the [1.0] is broadcast to all pairs.
+                pairs.extend(
+                    list(zip(idx_array[i_idx], idx_array[j_idx], [1.0] * len(i_idx)))
+                )
 
         if len(pairs) == 0:
             return np.zeros((0, 3), dtype=float)
@@ -792,18 +783,35 @@ class TwoDFMatcher:
     def _match_subdataframes(
         self, sub_df1, sub_df2, col_name, similarity_method, threshold, top_n
     ):
-        # same logic you already have:
+        # Filter out rows with missing or undesired values in the specified column
+        valid_df1 = sub_df1[
+            ~sub_df1[col_name].isnull()
+            & ~sub_df1[col_name].astype(str).str.lower().isin(["none", "nan"])
+        ]
+        valid_df2 = sub_df2[
+            ~sub_df2[col_name].isnull()
+            & ~sub_df2[col_name].astype(str).str.lower().isin(["none", "nan"])
+        ]
+
+        # If after filtering, either DataFrame is empty, return an empty result
+        if valid_df1.empty or valid_df2.empty:
+            return pd.DataFrame(columns=["df1_index", "df2_index", "similarity_score"])
+
         vectorizer = self._create_vectorizer(similarity_method)
-        combined_text = pd.concat([sub_df1[col_name], sub_df2[col_name]]).astype(str)
+        combined_text = pd.concat([valid_df1[col_name], valid_df2[col_name]]).astype(
+            str
+        )
         vectorizer.fit(combined_text)
 
-        tfidf_a = vectorizer.transform(sub_df1[col_name].astype(str))
-        tfidf_b = vectorizer.transform(sub_df2[col_name].astype(str))
+        tfidf_a = vectorizer.transform(valid_df1[col_name].astype(str))
+        tfidf_b = vectorizer.transform(valid_df2[col_name].astype(str))
 
         results_sparse = sp_matmul_topn(
             tfidf_a, tfidf_b.T, top_n=top_n, threshold=threshold, n_threads=-1
         )
-        return self._sparse_results_to_df(results_sparse, sub_df1.index, sub_df2.index)
+        return self._sparse_results_to_df(
+            results_sparse, valid_df1.index, valid_df2.index
+        )
 
     def _create_vectorizer(self, similarity_method):
         # same as your code
