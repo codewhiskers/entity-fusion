@@ -19,6 +19,7 @@ class SimilarityMatrixGenerator:
         Args:
             df (pd.DataFrame): The DataFrame to cluster
             conditions (dict): Nested dictionary specifying AND/OR logic
+            index (str, optional): Column to use as index
             must_links (set of tuples): Pairs (id1, id2) that must be clustered together
             cannot_links (set of tuples): Pairs (id1, id2) that must NOT be in same cluster
         """
@@ -33,21 +34,23 @@ class SimilarityMatrixGenerator:
         self.clusters = {}
         self.similarity_calculator = SimilarityCalculator()
         self.data_grouper = DataGrouper(self.df)
+        self.similarity_results = []  # Initialize empty results list
 
     def create_similarity_matrices(self):
         """
-        Create similarity matrices for specified columns and store them as lists of tuples.
+        Create similarity matrices for each column specified in the conditions.
+        This method processes the nested conditions structure and creates similarity
+        matrices for each column found in the leaf nodes.
         """
-        if not self.column_thresholds:
-            raise ValueError(
-                "No column thresholds specified for similarity computation."
-            )
+        # Extract all column parameters from the nested conditions
+        column_params = self._extract_column_params(self.conditions)
 
-        similarity_calculator = SimilarityCalculator()
-        data_grouper = DataGrouper(self.df)
+        if not column_params:
+            raise ValueError("No column parameters found in conditions.")
+
         similarity_results = []
 
-        for column, params in self.column_thresholds.items():
+        for column, params in column_params.items():
             if column not in self.df.columns:
                 raise ValueError(f"Column '{column}' not found in the dataframe.")
 
@@ -55,17 +58,17 @@ class SimilarityMatrixGenerator:
 
             # Group and process with a progress bar
             groups = list(
-                data_grouper.group_dataframe(params, column)
+                self.data_grouper.group_dataframe(params, column)
             )  # Convert generator to list for tqdm
             for group in tqdm(groups, desc=f"Processing groups for column '{column}'"):
                 if len(group) <= 1:
                     # Skip single-item groups
                     continue
 
-                group_data = similarity_calculator.initialize_vectorizer(
+                group_data = self.similarity_calculator.initialize_vectorizer(
                     params.get("similarity_method", "tfidf"), group[column]
                 )
-                result = similarity_calculator.create_similarity_matrix(
+                result = self.similarity_calculator.create_similarity_matrix(
                     group_data,
                     group.index,
                     column,
@@ -83,6 +86,28 @@ class SimilarityMatrixGenerator:
                 similarity_results.append((column, column_results))
 
         self.similarity_results = similarity_results
+
+    def _extract_column_params(self, condition):
+        """
+        Recursively extract column parameters from the nested conditions structure.
+
+        Returns:
+            dict: A dictionary mapping column names to their parameters
+        """
+        column_params = {}
+
+        if "and" in condition:
+            for sub_cond in condition["and"]:
+                column_params.update(self._extract_column_params(sub_cond))
+        elif "or" in condition:
+            for sub_cond in condition["or"]:
+                column_params.update(self._extract_column_params(sub_cond))
+        else:
+            # This is a leaf node with column parameters
+            for col, params in condition.items():
+                column_params[col] = params
+
+        return column_params
 
     def _construct_similarity_graph(self):
         """
@@ -226,7 +251,7 @@ class SimilarityMatrixGenerator:
     def _derive_final_labels_with_old(self, clusters, old_label_map):
         """
         clusters: dict node -> component_id
-        old_label_map: dict node -> old_label (like 'master_1')
+        old_label_map: dict node -> old_label (like 'main_1')
         """
         comp_to_nodes = defaultdict(list)
         for node, comp_id in clusters.items():
@@ -392,20 +417,18 @@ class SimilarityCalculator:
         for val, idx_list in value_to_indices.items():
             n = len(idx_list)
             if n > 1:
-                # Convert to a numpy array for vectorized operations.
-                idx_array = np.array(idx_list)
-                # Generate indices for the upper triangle (i < j).
-                i_idx, j_idx = np.triu_indices(n, k=1)
-                # Create the pairs all at once
-                # Note: the [1.0] is broadcast to all pairs.
-                pairs.extend(
-                    list(zip(idx_array[i_idx], idx_array[j_idx], [1.0] * len(i_idx)))
-                )
+                # Generate all pairs manually without using numpy arrays
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        pairs.append([idx_list[i], idx_list[j], 1.0])
 
         if len(pairs) == 0:
-            return np.zeros((0, 3), dtype=float)
+            # Return an empty array with 3 columns (id1, id2, similarity)
+            return np.zeros((0, 3), dtype=object)
 
-        return np.array(pairs, dtype=float)
+        # Use object dtype to handle both numeric and string indices
+        result_array = np.array(pairs, dtype=object)
+        return result_array
 
     def _create_cosine_similarity_matrix(
         self, group_tfidf, group_ids, column_name, threshold
@@ -442,9 +465,18 @@ class SimilarityCalculator:
         cols = cols[mask]
         vals = vals[mask]
 
-        group_ids_arr = np.array(group_ids)
-        similarities = np.vstack((group_ids_arr[rows], group_ids_arr[cols], vals)).T
-        return similarities
+        # Convert group_ids to a list if it's not already
+        group_ids_list = list(group_ids)
+
+        # Create the similarity matrix with object dtype to handle any index type
+        similarities = []
+        for i, j, val in zip(rows, cols, vals):
+            similarities.append([group_ids_list[i], group_ids_list[j], val])
+
+        if not similarities:
+            return np.zeros((0, 3), dtype=object)
+
+        return np.array(similarities, dtype=object)
 
 
 class DataGrouper:
@@ -655,31 +687,45 @@ class TwoDFMatcher:
         # Intersect them, because a leaf with multiple columns typically means "AND"
         return self._intersect_match_dicts(all_columns_dicts)
 
-    def _compute_matches_for_single_column(self, df1, df2, column, params, top_n):
+    def _compute_edges_for_single_column(self, column, params):
         """
-        Return a dict { (df1_idx, df2_idx): { column: similarity } }
+        Compute all pairs (id1, id2) that meet the threshold for one column + similarity method + blocking
         """
+        # Extract parameters
         threshold = params.get("threshold", 0.8)
-        sim_method = params.get("similarity_method", "tfidf")
-        blocking_criteria = params.get("blocking_criteria", [])
+        similarity_method = params.get("similarity_method", "tfidf")
+        if similarity_method == "exact":
+            threshold = 1.0
 
-        # 1) blocking
-        block_pairs = list(
-            self._generate_block_pairs(df1, df2, column, blocking_criteria, params)
-        )
-        out = {}
-        # Wrap block_pairs in a tqdm loop
-        for sub_df1, sub_df2 in tqdm(block_pairs, desc=f"Block pairs for {column}"):
-            if sub_df1.empty or sub_df2.empty:
+        # 1) Break dataframe into groups according to blocking
+        groups = list(
+            self.data_grouper.group_dataframe(params, column)
+        )  # see DataGrouper below
+
+        all_pairs = set()
+        for group in tqdm(groups, desc=f"Processing groups for column '{column}'"):
+            if len(group) <= 1:
                 continue
-            block_result_df = self._match_subdataframes(
-                sub_df1, sub_df2, column, sim_method, threshold, top_n
+
+            # 2) Vectorize / compute similarity within this group
+            group_data = self.similarity_calculator.initialize_vectorizer(
+                similarity_method, group[column]
             )
-            # block_result_df: df1_index, df2_index, similarity_score
-            for row in block_result_df.itertuples():
-                pair = (row.df1_index, row.df2_index)
-                out[pair] = {column: row.similarity_score}
-        return out
+
+            # 3) Build adjacency list from threshold
+            similarity_arr = self.similarity_calculator.create_similarity_matrix(
+                group_data, group.index, column, threshold, similarity_method
+            )
+
+            # similarity_arr is Nx3: [id1, id2, sim]
+            for id1, id2, sim in similarity_arr:
+                # Build pairs in canonical order
+                # For string indices, we use string comparison
+                if str(id1) > str(id2):
+                    id1, id2 = id2, id1
+                all_pairs.add((id1, id2))
+
+        return all_pairs
 
     def _intersect_match_dicts(self, dict_list):
         """
@@ -834,12 +880,17 @@ class TwoDFMatcher:
         else:
             raise ValueError(f"Unsupported similarity method: {similarity_method}")
 
+    # In TwoDFMatcher._sparse_results_to_df method:
     def _sparse_results_to_df(self, sparse_matrix, index_a, index_b):
         coo = sparse_matrix.tocoo()
         rows, cols, data = coo.row, coo.col, coo.data
 
-        df1_indices = index_a.to_numpy()[rows]
-        df2_indices = index_b.to_numpy()[cols]
+        # Convert index_a and index_b to lists
+        index_a_list = index_a.tolist()
+        index_b_list = index_b.tolist()
+
+        df1_indices = [index_a_list[i] for i in rows]
+        df2_indices = [index_b_list[i] for i in cols]
 
         result_df = pd.DataFrame(
             {
@@ -853,14 +904,14 @@ class TwoDFMatcher:
 
 if __name__ == "__main__":
     df = pd.read_csv("test_data/100k.csv", nrows=100_000, encoding="latin-1")
-    # pdb.set_trace()
     df = df[["BorrowerName", "BorrowerAddress", "BorrowerCity"]]
     df.reset_index(inplace=True)
+    df["index"] = df["index"].apply(lambda x: "main" + str(x))
 
-    old_label_map = {28600: "master_1", 28871: "master_1"}
+    old_label_map = {28600: "main_1", 28871: "main_2"}
     df["cluster_label"] = None
     df.loc[[28600, 28871], "cluster_label"] = [old_label_map[i] for i in [28600, 28871]]
-    # pdb.set_trace()
+
     my_conditions = {
         "or": [
             {
@@ -893,50 +944,39 @@ if __name__ == "__main__":
         ]
     }
 
-    smg = SimilarityMatrixGenerator(df, my_conditions)
+    # Use the new API exclusively
+    smg = SimilarityMatrixGenerator(df, my_conditions, index="index")
+    # df = smg.cluster_data()
     df = smg.cluster_data(old_label_map=old_label_map)
+
+    # Remove debugger breakpoint
     pdb.set_trace()
 
-    # df1 = df.iloc[:100_000]
-    # df2 = df.iloc[100_000:1_000_000]
-
-    # matcher = TwoDFMatcher()
-    # pdb.set_trace()
-    # Let's keep top 3 matches per row, apply a final global threshold if needed
-    # results = matcher.match_two_dataframes_blocking_conditions(
-    #     df1=df1,
-    #     df2=df2,
-    #     conditions=my_conditions,
-    #     top_n=3,
-    #     global_threshold=0.0,
-    # )
-    # pdb.set_trace()
-
-    # merged = results.merge(
-    #     df1, left_on="df1_index", right_index=True, how="left"
-    # ).merge(
-    #     df2,
-    #     left_on="df2_index",
-    #     right_index=True,
-    #     how="left",
-    #     suffixes=("_df1", "_df2"),
-    # )
-    # pdb.set_trace()
-    # column_thresholds = {
-    #     "BorrowerName": {
-    #         "threshold": 0.6,
-    #         "blocking_column": ["BorrowerCity"],
-    #         "blocking_criteria": ["blocking_column"],
-    #         "similarity_method": "tfidf",
-    #     },
-    #     "BorrowerAddress": {
-    #         "threshold": 0.9,
-    #         "blocking_column": ["BorrowerCity"],
-    #         "blocking_criteria": ["blocking_column"],
-    #         "similarity_method": "tfidf",
-    #     },
-    # }
-    # pdb.set_trace()
-    EF = SimilarityMatrixGenerator(df, column_thresholds, combine_method="AND")
-    clustered_df = EF.cluster_data()
-    pdb.set_trace()
+    # No longer attempting to use the old API with column_thresholds
+    # Instead, if you need to use the AND logic, specify it in the conditions:
+    """
+    # Example of AND logic using the new API
+    and_conditions = {
+        "and": [
+            {
+                "BorrowerName": {
+                    "threshold": 0.6,
+                    "blocking_column": ["BorrowerCity"],
+                    "blocking_criteria": ["blocking_column"],
+                    "similarity_method": "tfidf",
+                }
+            },
+            {
+                "BorrowerAddress": {
+                    "threshold": 0.9,
+                    "blocking_column": ["BorrowerCity"],
+                    "blocking_criteria": ["blocking_column"],
+                    "similarity_method": "tfidf",
+                }
+            }
+        ]
+    }
+    
+    smg_and = SimilarityMatrixGenerator(df, and_conditions)
+    clustered_df_and = smg_and.cluster_data()
+    """
