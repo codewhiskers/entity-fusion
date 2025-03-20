@@ -380,7 +380,7 @@ class SimilarityCalculator:
                 group_tfidf, group_ids, column_name, threshold
             )
 
-    def _create_exact_match_matrix_optimized(self, group_data, group_ids):
+    def _create_exact_match_matrix(self, group_data, group_ids):
         from collections import defaultdict
         import numpy as np
 
@@ -939,3 +939,4 @@ if __name__ == "__main__":
     # pdb.set_trace()
     EF = SimilarityMatrixGenerator(df, column_thresholds, combine_method="AND")
     clustered_df = EF.cluster_data()
+    pdb.set_trace()
