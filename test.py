@@ -262,16 +262,17 @@ class EntityClustering:
         else:
             grouped = [self.df]
 
-        for g in tqdm(grouped, desc="Blocking"):
+        for g in grouped:
             self._process_block(g)
 
-    def save_unionfind(self, path):
-        with open(path, "wb") as f:
-            pickle.dump(self.uf.parent, f)
+        cluster_labels = {
+            node: root for root, nodes in self.uf.components() for node in nodes
+        }
+        self.df["cluster_id"] = self.df["row_hash"].map(cluster_labels)
 
-    def load_unionfind(self, path):
-        with open(path, "rb") as f:
-            self.uf.parent = pickle.load(f)
+        if self.deduped_clustered_path:
+            deduped = self.df.drop_duplicates("cluster_id")
+            deduped.to_parquet(self.deduped_clustered_path, index=False)
 
 
 class IncrementalEntityClustering(EntityClustering):
