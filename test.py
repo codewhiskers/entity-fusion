@@ -35,14 +35,6 @@ class UnionFind:
             groups[root].add(node)
         return list(groups.values())
 
-    # def save(self, path):
-    #     with open(path, "wb") as f:
-    #         pickle.dump(self.parent, f)
-
-    # def load(self, path):
-    #     with open(path, "rb") as f:
-    #         self.parent = pickle.load(f)
-
 
 class EntityClustering:
     def __init__(
@@ -94,11 +86,6 @@ class EntityClustering:
             ]
         )
 
-        if index is None:
-            raise ValueError("Please include an index field")
-        else:
-            self.index = index
-
         original_columns = self.df.columns.tolist()
         columns_used_to_cluster = []
         for col, col_config in self.fields_config.items():
@@ -108,9 +95,30 @@ class EntityClustering:
                     columns_used_to_cluster.append(blocked_column)
             if col not in columns_used_to_cluster:
                 columns_used_to_cluster.append(col)
+        # if "BorrowerName" in columns_used_to_cluster:
+        #     pdb.set_trace()
+        # Add row_hash if index not provided
+        if index is None:
+            print(
+                "No index provided. Generating row_hash based on clustering columns..."
+            )
+            self.df["row_hash"] = self.df.apply(
+                lambda row: self._compute_row_hash(row, columns_used_to_cluster), axis=1
+            )
+            self.index = "row_hash"
+        else:
+            self.index = index
 
         self.df_original = self.df[[self.index] + original_columns].copy()
         self.df = self.df[[self.index] + columns_used_to_cluster]
+        self.df.drop_duplicates(subset=self.index, inplace=True)
+
+    def _compute_row_hash(self, row, cols):
+        val = "|".join(
+            str(row[col]).strip().lower() if pd.notnull(row[col]) else ""
+            for col in cols
+        )
+        return hashlib.md5(val.encode()).hexdigest()
 
     def _vectorize_column(self, series, vectorizer_type="count"):
         series = series.fillna("").astype(str)
@@ -159,11 +167,13 @@ class EntityClustering:
             return set.union(*edge_sets)
 
     def apply_blocking_columns(self, df, fields_config):
+        # if len(df) > 4000:
+        #     pdb.set_trace()
         df = df.copy()
         for field, config in fields_config.items():
             block_col = config.get("block_on")
             if block_col:
-                block_name = f"block__{field}"
+                block_name = f"block__{block_col}"
                 series = df[block_col].astype(str).str.strip().str.lower()
 
                 trim_length = config.get("block_trim")
@@ -172,44 +182,6 @@ class EntityClustering:
 
                 df[block_name] = series
         return df
-
-    def _deduplicate_for_comparison(self, df, col):
-        """
-        Create a deduplicated version for similarity comparison while maintaining
-        mapping back to original indices.
-        """
-        # Group by the column value and collect all indices for each unique value
-        grouped = df.groupby(col)[self.index].apply(list).reset_index()
-        grouped.columns = [col, "original_indices"]
-
-        # Create a mapping from deduplicated index to original indices
-        dedup_to_original = {}
-        for idx, row in grouped.iterrows():
-            dedup_to_original[idx] = row["original_indices"]
-
-        # Create deduplicated dataframe for comparison
-        dedup_df = grouped[[col]].copy()
-        dedup_df["dedup_index"] = dedup_df.index
-
-        return dedup_df, dedup_to_original
-
-    def _expand_dedup_pairs_to_original(self, pairs, dedup_to_original):
-        """
-        Expand similarity pairs from deduplicated indices back to all original indices.
-        """
-        expanded_pairs = []
-        for i, j, score in pairs:
-            # Get all original indices for both deduplicated indices
-            original_i_list = dedup_to_original[i]
-            original_j_list = dedup_to_original[j]
-
-            # Create pairs between all combinations of original indices
-            for orig_i in original_i_list:
-                for orig_j in original_j_list:
-                    if orig_i != orig_j:  # Avoid self-pairs
-                        expanded_pairs.append((orig_i, orig_j, score))
-
-        return expanded_pairs
 
     def _get_cluster_id(self, component):
         if self.use_hash_cluster_id:
@@ -220,7 +192,11 @@ class EntityClustering:
             return sorted(component)[0]
 
     def run(self):
-        from collections import defaultdict
+        if self.df[[x for x in self.df.columns if x != "index"]].duplicated().any():
+            raise ValueError(
+                f"Duplicate values found in your dataframe. "
+                "Please ensure the rows in the DataFrame are unique."
+            )
 
         all_edges_by_field = {}
         all_comparisons = []
@@ -230,13 +206,16 @@ class EntityClustering:
         print("Blocking columns applied.")
 
         for col, params in self.fields_config.items():
+            # if col == "BorrowerName":
+            #     pdb.set_trace()
             blocking_col = params.get("block_on")
             blocking_col = f"block__{blocking_col}"
             threshold = params.get("threshold", 0.85)
-            vectorizer_type = params.get("vectorizer", "count")
-            topn = params.get("topn", self.topn)
+            vectorizer_type = params.get("vectorizer", "tfidf")
+            # topn = params.get("topn", self.topn)
 
             field_df = self.df.copy()
+
             block_values = field_df[blocking_col].dropna().unique()
 
             field_edges = set()
@@ -251,80 +230,53 @@ class EntityClustering:
                         continue
 
                 g = g.copy()
-
-                # Step 1: Normalize and deduplicate values
                 series = g[col].fillna("").astype(str).str.strip().str.lower()
-                unique_vals = series.drop_duplicates().reset_index(drop=True)
-
-                if len(unique_vals) < 2:
-                    continue
+                row_ids = g[self.index].tolist()
 
                 try:
-                    X = self._vectorize_column(
-                        unique_vals, vectorizer_type=vectorizer_type
-                    )
+                    X = self._vectorize_column(series, vectorizer_type=vectorizer_type)
                 except ValueError:
                     continue
 
-                value_pairs = self._get_similarity_pairs(X, threshold, unique_vals)
+                value_pairs = self._get_similarity_pairs(X, threshold)
 
-                # Step 2: Cluster values using UnionFind
-                idx_to_val = {i: v for i, v in unique_vals.items()}
+                # Add similarity edges
+                for i, j, score in value_pairs:
+                    id_i = row_ids[i]
+                    id_j = row_ids[j]
+                    if id_i != id_j:
+                        edge = (id_i, id_j, round(score, 2))
+                        field_edges.add(edge)
+                        all_comparisons.append((*edge, col))
 
-                uf = UnionFind()
-                for i, j, _ in value_pairs:
-                    uf.union(i, j)
+                # Add exact match edges
+                val_to_ids = defaultdict(list)
+                for val, idx in zip(series, g[self.index]):
+                    val_to_ids[val].append(idx)
 
-                components = uf.components()
-                # Step 3: Map values to all row indices
-                val_to_row_ids = defaultdict(list)
-                for i, val in series.items():
-                    val_to_row_ids[val].append(g.loc[i, self.index])
-
-                # 👇 Add exact match edges (if enabled) always enabled
-                # if params.get("exact_match", False):
-                for val, ids in tqdm(val_to_row_ids.items()):
+                for val, ids in val_to_ids.items():
                     if len(ids) > 1:
                         for i, j in combinations(ids, 2):
                             edge = (i, j, 1.0)
                             field_edges.add(edge)
-                            all_comparisons.append((i, j, 1.0, col))
-
-                # Step 4: Expand value-pairs to row-pairs (edges)
-                for i, j, score in tqdm(value_pairs):
-                    val_i = idx_to_val[i]
-                    val_j = idx_to_val[j]
-
-                    ids_i = val_to_row_ids[val_i]
-                    ids_j = val_to_row_ids[val_j]
-
-                    if val_i == val_j:
-                        for row_i, row_j in combinations(ids_i, 2):
-                            edge = (row_i, row_j, round(score, 2))
-                            field_edges.add(edge)
                             all_comparisons.append((*edge, col))
-                    else:
-                        for row_i in ids_i:
-                            for row_j in ids_j:
-                                edge = (row_i, row_j, round(score, 2))
-                                field_edges.add(edge)
-                                all_comparisons.append((*edge, col))
 
             if field_edges:
                 all_edges_by_field[col] = field_edges
 
-        # Combine edges using AND/OR logic
+        # Combine edges across fields
         if not all_edges_by_field:
             print("No edges found.")
             self.comparison_df = pd.DataFrame(
                 columns=["id1", "id2", "similarity_score", "field"]
             )
             return self.df, self.comparison_df
+
         print("Combining edges across fields...")
         combined_edges = self._combine_edge_sets(list(all_edges_by_field.values()))
         print(f"Total combined edges: {len(combined_edges)}")
 
-        # Run UnionFind on combined edges
+        # Run Union-Find
         for i, j, _ in tqdm(combined_edges, desc="Union-Find Clustering"):
             self.uf.union(i, j)
 
@@ -337,11 +289,24 @@ class EntityClustering:
 
         self.df["cluster_id"] = self.df[self.index].map(cluster_labels)
 
-        # Comparison dataframe
         self.comparison_df = pd.DataFrame(
             all_comparisons, columns=["id1", "id2", "similarity_score", "field"]
         )
+        # Identify rows with no cluster assignment
+        unclustered_mask = self.df["cluster_id"].isna()
+        # pdb.set_trace()
+        # Option 1: use row_hash (already computed elsewhere)
+        if "row_hash" in self.df.columns:
+            self.df.loc[unclustered_mask, "cluster_id"] = self.df.loc[
+                unclustered_mask, "row_hash"
+            ]
 
+        self.df = self.df_original.merge(
+            self.df[["row_hash", "cluster_id"]],
+            on="row_hash",
+            how="left",
+        )
+        self.df.drop(columns=["row_hash"], inplace=True)
         return self.df, self.comparison_df
 
 
@@ -349,23 +314,41 @@ if __name__ == "__main__":
     df = pd.read_csv("test_data/100k.csv", nrows=100_000, encoding="latin-1")
     df = df[["BorrowerName", "BorrowerAddress", "BorrowerCity"]]
     df["BorrowerCity"] = df["BorrowerCity"].str.strip().str.lower()
-    df = df[df["BorrowerCity"].str.contains("^sc", na=False)]
+    # df = df[df["BorrowerCity"].str.contains("^sc", na=False)]
     # df = df.drop_duplicates(subset=["BorrowerCity"]).reset_index(drop=True)
     fields_config = {
         "BorrowerCity": {
             "block_on": "BorrowerCity",
             "block_trim": 1,
             "threshold": 0.75,
-            "topn": 5,
-            "exact_match": True,
+            "vectorizer": "count",
         },
     }
     df.reset_index(drop=True, inplace=True)
     df.reset_index(inplace=True)
 
     df, df_comp = EntityClustering(
-        df=df, fields_config=fields_config, index="index"
+        df=df,
+        fields_config=fields_config,
+        # index="index",
     ).run()
-    # Merge id1
-
+    df.rename(columns={"cluster_id": "BorrowerCity_cluster_id"}, inplace=True)
+    # pdb.set_trace()
+    fields_config = {
+        "BorrowerName": {
+            "block_on": "BorrowerCity_cluster_id",
+            "threshold": 0.75,
+            "vectorizer": "tfidf",
+        },
+        "BorrowerAddress": {
+            "block_on": "BorrowerCity_cluster_id",
+            "threshold": 0.9,
+            "vectorizer": "tfidf",
+        },
+    }
+    df_final, df_comp = EntityClustering(
+        df=df,
+        fields_config=fields_config,
+        # index="index",
+    ).run()
     pdb.set_trace()
