@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 from tqdm import tqdm
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from sklearn.preprocessing import normalize
@@ -6,6 +7,7 @@ from sparse_dot_topn import awesome_cossim_topn
 from sparse_dot_topn import sp_matmul_topn
 import hashlib
 import pdb
+import re
 import pickle
 from collections import defaultdict
 from sentence_transformers import SentenceTransformer
@@ -128,17 +130,30 @@ class EntityClustering:
         return hashlib.md5(val.encode()).hexdigest()
 
     def _vectorize_column(self, series, vectorizer_type="count"):
+        def string_grouper_ngram_analyzer(string):
+            # Normalize, lowercase, remove punctuation/whitespace
+            string = normalize("NFKD", string).encode("ASCII", "ignore").decode()
+            string = re.sub(r"[,-./]|\s", "", string.lower())
+
+            # Generate trigrams
+            return ["".join(t) for t in zip(*[string[i:] for i in range(3)])]
+
         series = series.fillna("").astype(str)
 
         if vectorizer_type == "count":
             vectorizer = CountVectorizer(analyzer="char", ngram_range=(1, 4))
         else:
+            # vectorizer = TfidfVectorizer(
+            #     analyzer=string_grouper_ngram_analyzer,
+            #     dtype=np.float32,
+            # )
+
             vectorizer = TfidfVectorizer(
                 analyzer="char",
                 ngram_range=(3, 3),
                 norm="l2",
                 sublinear_tf=False,
-                dtype="float32",
+                dtype=np.float32,
             )
 
         X = vectorizer.fit_transform(series)
@@ -216,50 +231,137 @@ class EntityClustering:
         else:
             return set.union(*edge_sets)
 
-    def _get_sparse_similarity_matrix_partitioned(
-        self, X, threshold, topn=5, block_size=5_000
-    ):
-        def chunk_indices(n, chunk_size):
-            return [range(i, min(i + chunk_size, n)) for i in range(0, n, chunk_size)]
+    # def _get_sparse_similarity_matrix_partitioned(
+    #     self, X, threshold, topn=5, block_size=5_000
+    # ):
+    #     def chunk_indices(n, chunk_size):
+    #         return [range(i, min(i + chunk_size, n)) for i in range(0, n, chunk_size)]
 
+    #     n = X.shape[0]
+    #     row_chunks = chunk_indices(n, block_size)
+    #     col_chunks = chunk_indices(n, block_size)
+
+    #     row_blocks = []
+    #     for row_idx in tqdm(
+    #         row_chunks, desc="processing blocks", total=len(row_chunks)
+    #     ):
+    #         row_A = X[row_idx]
+    #         col_blocks = []
+    #         for col_idx in col_chunks:
+    #             col_B = X[col_idx]
+    #             sim_block = awesome_cossim_topn(
+    #                 row_A,
+    #                 col_B.T,
+    #                 topn,
+    #                 threshold,
+    #                 use_threads=True,
+    #                 n_jobs=8,
+    #                 return_best_ntop=False,
+    #             )
+    #             # sim_block = sp_matmul_topn(
+    #             #     row_A,
+    #             #     col_B.T,
+    #             #     top_n=topn,
+    #             #     threshold=threshold,
+    #             #     sort=False,  # Optional: sort matches by descending similarity
+    #             #     n_threads=4,  # Optional: set threads explicitly
+    #             # )
+    #             col_blocks.append(sim_block)
+    #         row_blocks.append(hstack(col_blocks))
+    #     sim_matrix = vstack(row_blocks)
+    #     rows, cols = sim_matrix.nonzero()
+    #     values = sim_matrix.data
+
+    #     value_pairs = [
+    #         (i, j, round(v, 4)) for i, j, v in zip(rows, cols, values) if i < j
+    #     ]
+    #     return value_pairs
+
+    def estimate_n_blocks(self, X, max_rows_per_block=4000, max_total_blocks=64):
+        """
+        Estimate (n_row_blocks, n_col_blocks) based on matrix size.
+
+        Args:
+            X (csr_matrix): TF-IDF matrix
+            max_rows_per_block (int): Target rows per block (controls granularity)
+            max_total_blocks (int): Optional upper limit to prevent over-chunking
+
+        Returns:
+            Tuple[int, int]: Number of row and column blocks
+        """
         n = X.shape[0]
-        row_chunks = chunk_indices(n, block_size)
-        col_chunks = chunk_indices(n, block_size)
 
-        row_blocks = []
-        for row_idx in tqdm(
-            row_chunks, desc="processing blocks", total=len(row_chunks)
+        n_row_blocks = max(1, round(n / 1_000_000))  # coarse splitting for big corpora
+        n_col_blocks = max(1, round(n / max_rows_per_block))
+
+        # Limit to avoid too many tiny blocks
+        if n_row_blocks * n_col_blocks > max_total_blocks:
+            scale = (n_row_blocks * n_col_blocks) / max_total_blocks
+            n_row_blocks = max(1, int(n_row_blocks / scale))
+            n_col_blocks = max(1, int(n_col_blocks / scale))
+
+        return (n_row_blocks, n_col_blocks)
+
+    def _get_sparse_similarity_matrix_partitioned(
+        self, X, threshold, topn, n_blocks=(4, 4)
+    ):
+        """
+        Computes cosine similarities in block-wise fashion using sp_matmul_topn or awesome_cossim_topn and merges results,
+        without using zip_sp_matmul_topn.
+        """
+
+        def chunk_indices(n, n_chunks):
+            chunk_size = int(np.ceil(n / n_chunks))
+            return [
+                slice(i * chunk_size, min((i + 1) * chunk_size, n))
+                for i in range(n_chunks)
+            ]
+
+        row_chunks = chunk_indices(X.shape[0], n_blocks[0])
+        col_chunks = chunk_indices(X.shape[0], n_blocks[1])
+
+        block_results = []
+        for row_slice in tqdm(
+            row_chunks, desc="Processing row blocks", total=len(row_chunks)
         ):
-            row_A = X[row_idx]
-            col_blocks = []
-            for col_idx in col_chunks:
-                col_B = X[col_idx]
-                # sim_block = awesome_cossim_topn(
-                #     row_A,
-                #     col_B.T,
-                #     topn,
-                #     threshold,
-                #     use_threads=True,
-                #     return_best_ntop=False,
-                # )
-                sim_block = sp_matmul_topn(
-                    row_A,
-                    col_B.T,
-                    top_n=topn,
-                    threshold=threshold,
-                    sort=False,  # Optional: sort matches by descending similarity
-                    n_threads=4,  # Optional: set threads explicitly
-                )
-                col_blocks.append(sim_block)
-            row_blocks.append(hstack(col_blocks))
-        sim_matrix = vstack(row_blocks)
-        rows, cols = sim_matrix.nonzero()
-        values = sim_matrix.data
+            row_block = X[row_slice]
+            row_partial_results = []
 
-        value_pairs = [
-            (i, j, round(v, 4)) for i, j, v in zip(rows, cols, values) if i < j
-        ]
-        return value_pairs
+            for col_slice in col_chunks:
+                col_block = X[col_slice]
+
+                sim_block = awesome_cossim_topn(
+                    row_block,
+                    col_block.T,
+                    topn,
+                    threshold,
+                    # sort=True,
+                    use_threads=True,
+                    n_jobs=8,  # Optional: set threads explicitly
+                    return_best_ntop=False,
+                    # n_threads=max(
+                    #     1, self.num_threads if hasattr(self, "num_threads") else 1
+                    # ),
+                )
+
+                row_partial_results.append(sim_block)
+
+            # Horizontally stack all column chunks (same row block)
+            merged_row = hstack(row_partial_results).tocsr()
+
+            # Optional: enforce top-N per row manually
+            # (Not strictly necessary unless you want to prune across column chunks)
+
+            block_results.append(merged_row)
+
+        # Vertically stack all row blocks
+        full_matrix = vstack(block_results).tocsr()
+
+        # Extract non-zero entries
+        rows, cols = full_matrix.nonzero()
+        scores = full_matrix.data
+
+        return list(zip(rows, cols, scores))
 
     def get_simhash(self, text, n=3):
         text = text.strip().lower()
@@ -415,8 +517,9 @@ class EntityClustering:
                 if subset_X.shape[0] <= 20_000:
                     value_pairs = self._get_similarity_pairs(subset_X, threshold)
                 else:
+                    n_blocks = self.estimate_n_blocks(subset_X)
                     value_pairs = self._get_sparse_similarity_matrix_partitioned(
-                        subset_X, threshold, self.topn
+                        subset_X, threshold, self.topn, n_blocks=n_blocks
                     )
 
                 for i, j, score in value_pairs:
@@ -490,11 +593,11 @@ if __name__ == "__main__":
     df = pd.read_parquet("test_data/100k.parquet")
     df = df.drop_duplicates(["BorrowerAddress"])
     df = df[0:100_000]  # .reset_index(drop=True)
-
+    df["BorrowerName"] = df["BorrowerName"].astype(str).str.strip().str.lower()
     # df = df[df["BorrowerState"] == "AZ"]
 
     fields_config = {
-        "BorrowerAddress": {
+        "BorrowerName": {
             # "block_on": "BorrowerState",
             "threshold": 0.9,
             "vectorizer": "tfidf",
@@ -515,9 +618,9 @@ if __name__ == "__main__":
 
     # Time the grouping
     start = time.time()
-    matches = match_strings(df["BorrowerAddress"], min_similarity=0.9)
+    matches = match_strings(df["BorrowerName"], min_similarity=0.9)
     stringgrouper_time = time.time() - start
-    df[["group-id", "name_deduped"]] = group_similar_strings(df["BorrowerAddress"])
+    df[["group-id", "name_deduped"]] = group_similar_strings(df["BorrowerName"])
     # Collapse matches into groups – pass both the addresses and the matches
     # groups = group_similar_strings(addresses, matches)
 
@@ -545,12 +648,13 @@ if __name__ == "__main__":
     # df.rename(columns={"cluster_id": "BorrowerCity_cluster_id"}, inplace=True)
 
     fields_config = {
-        "BorrowerAddress": {
+        "BorrowerName": {
             "block_on": "BorrowerState",
-            "threshold": 0.9,
-            "vectorizer": "tfidf",
+            "threshold": 0.8,
+            "vectorizer": "count",
         },
     }
+
     df_final, df_comp = EntityClustering(
         df=df,
         fields_config=fields_config,
