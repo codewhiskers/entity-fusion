@@ -3,19 +3,22 @@ import numpy as np
 from tqdm import tqdm
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from sklearn.preprocessing import normalize
-from sparse_dot_topn import awesome_cossim_topn
-from sparse_dot_topn import sp_matmul_topn
+
+# from sparse_dot_topn import awesome_cossim_topn
+from sparse_dot_topn import sp_matmul_topn, zip_sp_matmul_topn
 import hashlib
 import pdb
 import re
-import pickle
+
+# import pickle
 from collections import defaultdict
 from sentence_transformers import SentenceTransformer
 from itertools import combinations
 import warnings
 from scipy.sparse import vstack, hstack
-from datasketch import MinHash, MinHashLSH
-from simhash import Simhash
+
+# from datasketch import MinHash, MinHashLSH
+# from simhash import Simhash
 from tqdm import tqdm
 from itertools import combinations
 from sklearn.feature_extraction.text import CountVectorizer
@@ -112,14 +115,14 @@ class EntityClustering:
                 "No index provided. Generating row_hash based on clustering columns..."
             )
             self.df["row_hash"] = self.df.apply(
-                lambda row: self._compute_row_hash(row, columns_used_to_cluster), axis=1
-            )
+                lambda row: self._compute_row_hash(row, self.df.columns), axis=1
+            )  # changed from columns_used_to_cluster
             self.index = "row_hash"
         else:
             self.index = index
 
-        self.df_original = self.df[[self.index] + original_columns].copy()
-        self.df = self.df[[self.index] + columns_used_to_cluster]
+        self.df_original = self.df[original_columns].copy()
+        # self.df = self.df[[self.index] + columns_used_to_cluster]
         self.df.drop_duplicates(subset=self.index, inplace=True)
 
     def _compute_row_hash(self, row, cols):
@@ -143,11 +146,6 @@ class EntityClustering:
         if vectorizer_type == "count":
             vectorizer = CountVectorizer(analyzer="char", ngram_range=(1, 4))
         else:
-            # vectorizer = TfidfVectorizer(
-            #     analyzer=string_grouper_ngram_analyzer,
-            #     dtype=np.float32,
-            # )
-
             vectorizer = TfidfVectorizer(
                 analyzer="char",
                 ngram_range=(3, 3),
@@ -164,118 +162,65 @@ class EntityClustering:
 
         return X
 
-    def _get_exact_match_pairs_fast(self, series):
-        duplicates = series.reset_index().groupby(series).filter(lambda x: len(x) > 1)
-        grouped = duplicates.groupby(series)
-        pairs = []
-        for _, group in grouped:
-            indices = group["index"].tolist()
-            for i in range(len(indices)):
-                for j in range(i + 1, len(indices)):
-                    pairs.append((indices[i], indices[j], 1.0))
-        return pairs
+    def _get_exact_match_pairs_fast(self, df, col, chunk_size=1000, max_pairs=10000):
+        if not self.index:
+            raise ValueError("Index column is not set.")
 
-    def get_minhash(self, text, num_perm=64):
-        m = MinHash(num_perm=num_perm)
-        for ngram in self._char_ngrams(text):
-            m.update(ngram.encode("utf8"))
-        return m
+        pairs = set()
+        grouped = df.groupby(col)
+        group_items = list(grouped)
 
-    def _char_ngrams(self, text, n=3):
-        text = text.strip().lower()
-        if len(text) < n:
-            return {text}
+        for i in range(0, len(group_items), chunk_size):
+            chunk = group_items[i : i + chunk_size]
+            for _, group in chunk:
+                n = len(group)
+                if n > 1:
+                    if (n * (n - 1)) // 2 > max_pairs:
+                        continue
+                    group_ids = group[self.index].tolist()
+                    for i, j in combinations(range(len(group_ids)), 2):
+                        id_i = group_ids[i]
+                        id_j = group_ids[j]
+                        pairs.add((id_i, id_j, 1.0))
 
-        # Use list comprehension instead of set comprehension for better performance
-        # when you have many duplicates
-        ngrams = [text[i : i + n] for i in range(len(text) - n + 1)]
-        return set(ngrams)  # Convert to set only once
+        return list(pairs)
 
-    def lsh_candidate_filtering(self, series, threshold=0.8, num_perm=64):
-        minhashes = {}
-        lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
+    def _get_similarity_pairs(self, X, col, threshold, row_ids=None):
+        if threshold == 1.0:
+            return self._get_exact_match_pairs_fast(X, col)
+        if X.shape[0] == 0:
+            return []
 
-        # Single pass: create, store, and insert MinHash objects
-        for idx, val in tqdm(
-            series.items(), desc="Creating MinHashes", total=len(series)
-        ):
-            m = self.get_minhash(val, num_perm)
-            minhashes[idx] = m
-            lsh.insert(idx, m)
-
-        # More efficient candidate pair generation
-        candidate_pairs = set()
-        for idx in minhashes:
-            results = lsh.query(minhashes[idx])
-            for j in results:
-                if j != idx:
-                    # Create ordered pair to avoid duplicates
-                    pair = tuple(sorted([idx, j]))
-                    candidate_pairs.add(pair)
-
-        return list(candidate_pairs)
-
-    def _get_similarity_pairs(self, X, threshold, series=None):
-        if threshold == 1.0 and series is not None:
-            return self._get_exact_match_pairs_fast(series)
-        sim_matrix = awesome_cossim_topn(
-            X, X, self.topn, threshold, use_threads=True, return_best_ntop=False
+        sim_matrix = sp_matmul_topn(
+            X,
+            X,
+            top_n=self.topn,
+            threshold=threshold,
+            sort=False,
+            n_threads=8,
         )
         rows, cols = sim_matrix.nonzero()
         values = sim_matrix.data
-        return [(i, j, v) for i, j, v in zip(rows, cols, values) if i < j]
+
+        if row_ids:
+            return [
+                (row_ids[i], row_ids[j], v)
+                for i, j, v in zip(rows, cols, values)
+                if i < j
+            ]
+        else:
+            return [(i, j, v) for i, j, v in zip(rows, cols, values) if i < j]
 
     def _combine_edge_sets(self, edge_sets):
         if self.combine_method == "AND":
-            return set.intersection(*edge_sets)
+            # Only return intersection if all fields produced at least one edge set
+            non_empty_sets = [s for s in edge_sets if s]
+            if len(non_empty_sets) == len(edge_sets):
+                return set.intersection(*non_empty_sets)
+            else:
+                return set()  # Some field didn't match anything, so AND = empty
         else:
             return set.union(*edge_sets)
-
-    # def _get_sparse_similarity_matrix_partitioned(
-    #     self, X, threshold, topn=5, block_size=5_000
-    # ):
-    #     def chunk_indices(n, chunk_size):
-    #         return [range(i, min(i + chunk_size, n)) for i in range(0, n, chunk_size)]
-
-    #     n = X.shape[0]
-    #     row_chunks = chunk_indices(n, block_size)
-    #     col_chunks = chunk_indices(n, block_size)
-
-    #     row_blocks = []
-    #     for row_idx in tqdm(
-    #         row_chunks, desc="processing blocks", total=len(row_chunks)
-    #     ):
-    #         row_A = X[row_idx]
-    #         col_blocks = []
-    #         for col_idx in col_chunks:
-    #             col_B = X[col_idx]
-    #             sim_block = awesome_cossim_topn(
-    #                 row_A,
-    #                 col_B.T,
-    #                 topn,
-    #                 threshold,
-    #                 use_threads=True,
-    #                 n_jobs=8,
-    #                 return_best_ntop=False,
-    #             )
-    #             # sim_block = sp_matmul_topn(
-    #             #     row_A,
-    #             #     col_B.T,
-    #             #     top_n=topn,
-    #             #     threshold=threshold,
-    #             #     sort=False,  # Optional: sort matches by descending similarity
-    #             #     n_threads=4,  # Optional: set threads explicitly
-    #             # )
-    #             col_blocks.append(sim_block)
-    #         row_blocks.append(hstack(col_blocks))
-    #     sim_matrix = vstack(row_blocks)
-    #     rows, cols = sim_matrix.nonzero()
-    #     values = sim_matrix.data
-
-    #     value_pairs = [
-    #         (i, j, round(v, 4)) for i, j, v in zip(rows, cols, values) if i < j
-    #     ]
-    #     return value_pairs
 
     def estimate_n_blocks(self, X, max_rows_per_block=4000, max_total_blocks=64):
         """
@@ -303,12 +248,10 @@ class EntityClustering:
         return (n_row_blocks, n_col_blocks)
 
     def _get_sparse_similarity_matrix_partitioned(
-        self, X, threshold, topn, n_blocks=(4, 4)
+        self, X, col, threshold, topn, n_blocks=(4, 4), row_ids=None
     ):
-        """
-        Computes cosine similarities in block-wise fashion using sp_matmul_topn or awesome_cossim_topn and merges results,
-        without using zip_sp_matmul_topn.
-        """
+        if threshold == 1.0:
+            return self._get_exact_match_pairs_fast(X, col)
 
         def chunk_indices(n, n_chunks):
             chunk_size = int(np.ceil(n / n_chunks))
@@ -321,83 +264,37 @@ class EntityClustering:
         col_chunks = chunk_indices(X.shape[0], n_blocks[1])
 
         block_results = []
-        for row_slice in tqdm(
-            row_chunks, desc="Processing row blocks", total=len(row_chunks)
-        ):
+        for row_slice in row_chunks:
             row_block = X[row_slice]
-            row_partial_results = []
-
+            row_results = []
             for col_slice in col_chunks:
                 col_block = X[col_slice]
 
-                sim_block = awesome_cossim_topn(
+                sim_block = sp_matmul_topn(
                     row_block,
                     col_block.T,
-                    topn,
-                    threshold,
-                    # sort=True,
-                    use_threads=True,
-                    n_jobs=8,  # Optional: set threads explicitly
-                    return_best_ntop=False,
-                    # n_threads=max(
-                    #     1, self.num_threads if hasattr(self, "num_threads") else 1
-                    # ),
+                    top_n=topn,
+                    threshold=threshold,
+                    sort=True,
+                    n_threads=8,
                 )
+                row_results.append(sim_block)
 
-                row_partial_results.append(sim_block)
-
-            # Horizontally stack all column chunks (same row block)
-            merged_row = hstack(row_partial_results).tocsr()
-
-            # Optional: enforce top-N per row manually
-            # (Not strictly necessary unless you want to prune across column chunks)
-
+            merged_row = zip_sp_matmul_topn(top_n=topn, C_mats=row_results)
             block_results.append(merged_row)
 
-        # Vertically stack all row blocks
         full_matrix = vstack(block_results).tocsr()
-
-        # Extract non-zero entries
         rows, cols = full_matrix.nonzero()
         scores = full_matrix.data
 
-        return list(zip(rows, cols, scores))
-
-    def get_simhash(self, text, n=3):
-        text = text.strip().lower()
-        tokens = (
-            [text[i : i + n] for i in range(len(text) - n + 1)]
-            if len(text) >= n
-            else [text]
-        )
-        return Simhash(tokens)
-
-    def simhash_candidate_filtering(self, series, max_distance=3, bucket_bits=8):
-        """
-        Simulates LSH-like querying using simple buckets on SimHash prefixes.
-        """
-        simhashes = {}
-        buckets = defaultdict(set)
-
-        for idx, val in tqdm(
-            series.items(), desc="Creating SimHashes", total=len(series)
-        ):
-            h = self.get_simhash(val)
-            simhashes[idx] = h
-            prefix = h.value >> (64 - bucket_bits)  # e.g., first 8 bits
-            buckets[prefix].add(idx)
-
-        candidate_pairs = set()
-
-        for bucket in tqdm(buckets.values()):
-            if len(bucket) < 2:
-                continue
-
-            for idx_i, idx_j in combinations(bucket, 2):
-                if simhashes[idx_i].distance(simhashes[idx_j]) <= max_distance:
-                    candidate_pairs.add((idx_i, idx_j))
-
-        return list(candidate_pairs)
+        if row_ids:
+            return [
+                (row_ids[i], row_ids[j], v)
+                for i, j, v in zip(rows, cols, scores)
+                if i < j
+            ]
+        else:
+            return [(i, j, v) for i, j, v in zip(rows, cols, scores) if i < j]
 
     def apply_blocking_columns(self, df, fields_config):
         df = df.copy()
@@ -423,11 +320,12 @@ class EntityClustering:
             return sorted(component)[0]
 
     def run(self):
-        if self.df[[x for x in self.df.columns if x != "index"]].duplicated().any():
-            raise ValueError(
-                f"Duplicate values found in your dataframe. "
-                "Please ensure the rows in the DataFrame are unique."
-            )
+        # if self.df[[x for x in self.df.columns if x != "index"]].duplicated().any():
+        #     pdb.set_trace()
+        #     raise ValueError(
+        #         f"Duplicate values found in your dataframe. "
+        #         "Please ensure the rows in the DataFrame are unique."
+        #     )
 
         all_edges_by_field = {}
         all_comparisons = []
@@ -436,7 +334,10 @@ class EntityClustering:
         self.df = self.apply_blocking_columns(self.df, self.fields_config)
         print("Blocking columns applied.")
 
+        field_df = self.df.copy()
+
         for col, params in self.fields_config.items():
+
             blocking_col_raw = params.get("block_on")
 
             if blocking_col_raw:
@@ -447,99 +348,78 @@ class EntityClustering:
                 block_values = [None]  # single pseudo-block
             threshold = params.get("threshold", 0.85)
             vectorizer_type = params.get("vectorizer", "tfidf")
-            field_df = self.df.copy()
-
-            # block_values = field_df[blocking_col].dropna().unique()
 
             field_edges = set()
-        BLOCK_LSH_THRESHOLD = 20_000  # Threshold for using LSH filtering
 
-        with tqdm(block_values) as pbar:
-            for block_val in pbar:
-                pbar.set_description(f"Processing {block_val}")
-                if blocking_col is None:
-                    g = field_df
-                else:
-                    g = field_df[field_df[blocking_col] == block_val]
-                if len(g) < 2:
-                    continue
-                if not self.group_nulls:
-                    g = g[g[col].notnull()]
+            # BLOCK_LSH_THRESHOLD = 20_000  # Threshold for using LSH filtering
+            with tqdm(block_values) as pbar:
+                for block_val in pbar:
+                    pbar.set_description(f"Processing {block_val}")
+                    if blocking_col is None:
+                        g = field_df
+                    else:
+                        g = field_df[field_df[blocking_col] == block_val]
                     if len(g) < 2:
                         continue
+                    if not self.group_nulls:
+                        g = g[g[col].notnull()]
+                        if len(g) < 2:
+                            continue
 
-                g = g.copy()
-                series = g[col].fillna("").astype(str).str.strip().str.lower()
-                row_ids = g[self.index].tolist()
+                    g = g.copy()
+                    g[col] = g[col].fillna("").astype(str).str.strip().str.lower()
+                    series = g[col].copy()
+                    row_ids = g[self.index].tolist()
+                    # subset_idx = list(range(len(series)))
 
-                use_lsh = len(g) > BLOCK_LSH_THRESHOLD
-                use_lsh = False
-                if use_lsh:
-                    print("Using LSH filtering for large block...")
-
-                    series_for_lsh = pd.Series({i: s for i, s in enumerate(series)})
-
-                    candidate_pairs = self.lsh_candidate_filtering(
-                        series_for_lsh, threshold=0.8
-                    )
-                    # candidate_pairs = self.simhash_candidate_filtering(
-                    #     series_for_lsh, max_distance=3
-                    # )
-                    if not candidate_pairs:
+                    try:
+                        if threshold != 1:
+                            subset_X = self._vectorize_column(
+                                series, vectorizer_type=vectorizer_type
+                            )
+                        else:
+                            subset_X = g[[self.index, col]]
+                    except ValueError:
+                        print(
+                            f"Skipping column {col} due to ValueError in vectorization. "
+                            "This may be due to too many unique values or empty strings."
+                        )
                         continue
 
-                    subset_idx = sorted(
-                        set(i for pair in candidate_pairs for i in pair)
-                    )
-                    series = series.iloc[subset_idx]
-                    row_ids = [
-                        row_ids[i] for i in subset_idx
-                    ]  # filter row_ids accordingly
-                else:
-                    subset_idx = list(range(len(series)))
+                    subset_id_map = {
+                        local_idx: row_ids[global_idx]
+                        for local_idx, global_idx in enumerate(range(len(row_ids)))
+                    }
+                    if subset_X.shape[0] <= 5_000:
+                        value_pairs = self._get_similarity_pairs(
+                            subset_X, col, threshold, row_ids=row_ids
+                        )
+                    else:
+                        n_blocks = self.estimate_n_blocks(subset_X)
+                        value_pairs = self._get_sparse_similarity_matrix_partitioned(
+                            subset_X,
+                            col,
+                            threshold,
+                            self.topn,
+                            n_blocks=n_blocks,
+                            row_ids=row_ids,
+                        )
 
-                try:
-                    subset_X = self._vectorize_column(
-                        series, vectorizer_type=vectorizer_type
-                    )
-                except ValueError:
-                    print(
-                        f"Skipping column {col} due to ValueError in vectorization. "
-                        "This may be due to too many unique values or empty strings."
-                    )
-                    continue
-
-                subset_id_map = {
-                    local_idx: row_ids[global_idx]
-                    for local_idx, global_idx in enumerate(range(len(row_ids)))
-                }
-
-                if subset_X.shape[0] <= 20_000:
-                    value_pairs = self._get_similarity_pairs(subset_X, threshold)
-                else:
-                    n_blocks = self.estimate_n_blocks(subset_X)
-                    value_pairs = self._get_sparse_similarity_matrix_partitioned(
-                        subset_X, threshold, self.topn, n_blocks=n_blocks
-                    )
-
-                for i, j, score in value_pairs:
-                    if i < j:
-                        id_i = subset_id_map[i]
-                        id_j = subset_id_map[j]
+                    for id_i, id_j, score in value_pairs:
                         edge = (id_i, id_j, round(score, 2))
                         field_edges.add(edge)
                         all_comparisons.append((*edge, col))
 
-                if field_edges:
-                    all_edges_by_field[col] = field_edges
-
+                    if field_edges:
+                        all_edges_by_field[col] = field_edges
+        #         pdb.set_trace()
         # Combine edges across fields
         if not all_edges_by_field:
             print("No edges found.")
             self.comparison_df = pd.DataFrame(
                 columns=["id1", "id2", "similarity_score", "field"]
             )
-            return self.df, self.comparison_df
+            return self.df_original, self.comparison_df
 
         print("Combining edges across fields...")
         combined_edges = self._combine_edge_sets(list(all_edges_by_field.values()))
@@ -550,13 +430,17 @@ class EntityClustering:
             self.uf.union(i, j)
 
         components = self.uf.components()
-        cluster_labels = {
-            node: self._get_cluster_id(component)
-            for component in components
-            for node in component
-        }
+        print(f"Total clusters found: {len(components)}")
+        cluster_labels = {}
+        for component in components:
+            cluster_id = self._get_cluster_id(component)
+            for node in component:
+                cluster_labels[node] = cluster_id
 
-        self.df["cluster_id"] = self.df[self.index].map(cluster_labels)
+        self.df["cluster_id"] = None
+        self.df.set_index(self.index, inplace=True)
+        self.df["cluster_id"].update(pd.Series(cluster_labels))
+        self.df.reset_index(inplace=True)
 
         self.comparison_df = pd.DataFrame(
             all_comparisons, columns=["id1", "id2", "similarity_score", "field"]
@@ -565,18 +449,41 @@ class EntityClustering:
         unclustered_mask = self.df["cluster_id"].isna()
 
         # Option 1: use row_hash (already computed elsewhere)
-        if "row_hash" in self.df.columns:
+        if self.index in self.df.columns:
             self.df.loc[unclustered_mask, "cluster_id"] = self.df.loc[
-                unclustered_mask, "row_hash"
+                unclustered_mask, self.index
             ]
-        # pdb.set_trace()
         self.df = self.df_original.merge(
-            self.df[["row_hash", "cluster_id"]],
-            on="row_hash",
+            self.df[[self.index, "cluster_id"]],
+            on=self.index,
             how="left",
         )
-        self.df.drop(columns=["row_hash"], inplace=True)
         return self.df, self.comparison_df
+
+
+# def _vectorize_column(series, vectorizer):
+#     vectorizer = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 5))
+#     return vectorizer.transform(series.fillna(""))
+
+# vectorizer = TfidfVectorizer().fit(all_text)
+
+# tfidf1 = _vectorize_column(df1[col], vectorizer)
+# tfidf2 = _vectorize_column(df2[col], vectorizer)
+
+# sim_matrix = awesome_cossim_topn(tfidf2, tfidf1, 10, 0.95, use_threads=True, return_best_ntop=False)
+# matches_coo = sim_matrix.tocoo()
+# matched_clusters = {}
+# for i, j, score in zip(matches_coo.row, matches_coo.col, matches_coo.data):
+# #     print(i, j, score)
+#     matched_clusters[i] = df_cluster.iloc[j]['cluster_id']
+
+# assigned_clusters = []
+# for i in range(df2.shape[0]):
+#     if i in matched_clusters:
+#         assigned_clusters.append(matched_clusters[i])
+#     else:
+#         assigned_clusters.append(-1)
+# df2['cluster_id'] = assigned_clusters
 
 
 if __name__ == "__main__":
@@ -591,12 +498,18 @@ if __name__ == "__main__":
     import time
 
     df = pd.read_parquet("test_data/100k.parquet")
-    df = df.drop_duplicates(["BorrowerAddress"])
+    df = df.drop_duplicates()
     df = df[0:100_000]  # .reset_index(drop=True)
-    df["BorrowerName"] = df["BorrowerName"].astype(str).str.strip().str.lower()
-    # df = df[df["BorrowerState"] == "AZ"]
-
+    # df = df.reset_index()
+    df["BorrowerAddress"] = df["BorrowerAddress"].astype(str).str.strip().str.lower()
+    df = df[df["BorrowerState"] == "CA"]
+    # pdb.set_trace()
     fields_config = {
+        "BorrowerAddress": {
+            # "block_on": "BorrowerState",
+            "threshold": 1,
+            "vectorizer": "tfidf",
+        },
         "BorrowerName": {
             # "block_on": "BorrowerState",
             "threshold": 0.9,
@@ -607,25 +520,29 @@ if __name__ == "__main__":
     # from your_package import EntityClustering  # use actual import
 
     start = time.time()
-    df_final, df_comp = EntityClustering(df=df, fields_config=fields_config).run()
+    # pdb.set_trace()
+    df_final, df_comp = EntityClustering(
+        df=df,
+        fields_config=fields_config,
+    ).run()
     your_time = time.time() - start
-
-    from string_grouper import match_strings, group_similar_strings
-    import time
+    pdb.set_trace()
+    # from string_grouper import match_strings, group_similar_strings
+    # import time
 
     # Extract just the address column
     # addresses = df["BorrowerAddress"].dropna().drop_duplicates().astype(str)
 
-    # Time the grouping
-    start = time.time()
-    matches = match_strings(df["BorrowerName"], min_similarity=0.9)
-    stringgrouper_time = time.time() - start
-    df[["group-id", "name_deduped"]] = group_similar_strings(df["BorrowerName"])
-    # Collapse matches into groups – pass both the addresses and the matches
-    # groups = group_similar_strings(addresses, matches)
+    # # Time the grouping
+    # start = time.time()
+    # matches = match_strings(df["BorrowerAddress"], min_similarity=0.9)
+    # stringgrouper_time = time.time() - start
+    # df[["group-id", "name_deduped"]] = group_similar_strings(df["BorrowerName"])
+    # # Collapse matches into groups – pass both the addresses and the matches
+    # # groups = group_similar_strings(addresses, matches)
 
-    print(f"EntityClustering time: {your_time:.2f}s")
-    print(f"String Grouper time: {stringgrouper_time:.2f}s")
+    # print(f"EntityClustering time: {your_time:.2f}s")
+    # print(f"String Grouper time: {stringgrouper_time:.2f}s")
 
     pdb.set_trace()
     # fields_config = {
