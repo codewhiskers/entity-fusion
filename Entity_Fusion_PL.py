@@ -607,6 +607,24 @@ class SimilarityMatrixGeneratorPolars:
             .unique(subset=[self.id_col], keep="last")
         )
 
+        combined = combined.with_columns([
+            pl.col(self.id_col).cast(id_dtype),
+            pl.col("cluster_label").cast(pl.Utf8) if self.always_string_labels
+            else pl.col("cluster_label").cast(pl.Int64),
+        ])
+        clustered_run = clustered_run.with_columns([
+            pl.col(self.id_col).cast(id_dtype),
+            pl.col("cluster_label").cast(pl.Utf8) if self.always_string_labels
+            else pl.col("cluster_label").cast(pl.Int64),
+        ])
+
+        # align column *set* and *order* to snapshot (so writers/readers are identical)
+        combined, clustered_run = self._align_for_concat([combined, clustered_run])
+
+        return combined, clustered_run
+
+
+
         return combined, clustered_run
 
     # convenience alias if you prefer the original name
