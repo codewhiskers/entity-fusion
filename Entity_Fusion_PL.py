@@ -46,7 +46,7 @@ def _ensure_id_col(df: pl.DataFrame, id_col: Optional[str]) -> Tuple[pl.DataFram
             )
         df = df.with_row_count("_id")
         return df, "_id"
-    if id_col not in df.columns:
+    if id_col not in df.columns: 
         raise ValueError(f"id_col '{id_col}' not found in DataFrame.")
     return df, id_col
 
@@ -248,7 +248,45 @@ class DataGrouperPolars:
 # -----------------------------
 
 
+from __future__ import annotations
+
+from collections import defaultdict, deque
+from itertools import combinations
+from typing import Dict, List, Optional, Set, Tuple, Union
+
+import polars as pl
+from tqdm import tqdm
+
+
+# If you already have this elsewhere, feel free to remove this helper.
+def _canonical_pair(a, b):
+    """Order-agnostic pair for set membership."""
+    return (a, b) if str(a) <= str(b) else (b, a)
+
+
+from __future__ import annotations
+
+from collections import defaultdict, deque
+from itertools import combinations
+from typing import Dict, List, Optional, Set, Tuple, Union
+
+import polars as pl
+from tqdm import tqdm
+
+
+# ---------- tiny helper ----------
+def _canonical_pair(a, b):
+    """Order-agnostic pair for set membership."""
+    return (a, b) if str(a) <= str(b) else (b, a)
+
+
 class SimilarityMatrixGeneratorPolars:
+    """
+    Build pairwise similarity edges (by column with AND/OR logic), cluster via
+    connected components, and support incremental updates against an existing
+    preclustered snapshot passed in as a DataFrame.
+    """
+
     def __init__(
         self,
         df: pl.DataFrame,
@@ -256,17 +294,17 @@ class SimilarityMatrixGeneratorPolars:
         id_col: Optional[str] = None,
         must_links: Optional[Set[Tuple[object, object]]] = None,
         cannot_links: Optional[Set[Tuple[object, object]]] = None,
-        # --- NEW incremental params ---
-        preclustered_file_path: Optional[str] = None,
+        *,
         unclustered_sentinels: Set[object] = frozenset({"-1", -1, "unclustered", None, ""}),
         carry_forward_singletons: bool = True,
-        include_old_labeled_in_run: bool = True,
-        persist_on_finish: bool = True,
+        include_old_labeled_in_run: bool = False,
+        always_string_labels: bool = True,  # keep labels Utf8 across runs (recommended)
     ):
         self.df, self.id_col = _ensure_id_col(df, id_col)
         self.conditions = conditions
-        self.must_links = must_links if must_links else set()
-        self.cannot_links = cannot_links if cannot_links else set()
+
+        self.must_links: Set[Tuple[object, object]] = set(must_links or set())
+        self.cannot_links: Set[Tuple[object, object]] = set(cannot_links or set())
 
         self.graph: Dict[object, Set[object]] = defaultdict(set)
         self.clusters: Dict[object, Union[int, str]] = {}
@@ -274,20 +312,22 @@ class SimilarityMatrixGeneratorPolars:
         self.grouper = DataGrouperPolars(self.df, self.id_col)
         self.similarity_results: List[Tuple[str, List[List[object]]]] = []
 
-        # --- NEW: store incremental settings ---
-        self.preclustered_file_path = preclustered_file_path
         self.unclustered_sentinels = set(unclustered_sentinels)
         self.carry_forward_singletons = carry_forward_singletons
         self.include_old_labeled_in_run = include_old_labeled_in_run
-        self.persist_on_finish = persist_on_finish
+        self.always_string_labels = always_string_labels
 
-    # ---- public API ----
+    # ---------------------------------------------------------------------
+    # Public API
+    # ---------------------------------------------------------------------
 
     def create_similarity_matrices(self) -> None:
+        """Compute per-column similarity results and store them in self.similarity_results."""
         column_params = self._extract_column_params(self.conditions)
         if not column_params:
             raise ValueError("No column parameters found in conditions.")
-        similarity_results: List[Tuple[str, List[List[object]]]] = []
+
+        results: List[Tuple[str, List[List[object]]]] = []
 
         for column, params in column_params.items():
             if column not in self.df.columns:
@@ -296,90 +336,88 @@ class SimilarityMatrixGeneratorPolars:
             column_results: List[List[object]] = []
             groups = self.grouper.group_dataframe(params, column)
 
-            for group in tqdm(groups, desc=f"Processing blocks for column '{column}'"):
+            for group in tqdm(groups, desc=f"Processing blocks for column '{column}'", leave=False):
                 ids = group[self.id_col].to_list()
                 texts = group[column].cast(pl.Utf8).to_list()
 
                 group_data = self.sim_calc.initialize_vectorizer(
                     params.get("similarity_method", "tfidf"), texts
                 )
+                threshold = 1.0 if params.get("similarity_method") == "exact" else params.get("threshold", 0.8)
                 arr = self.sim_calc.create_similarity_matrix(
-                    group_data,
-                    ids,
-                    column,
-                    (
-                        params.get("threshold", 0.8)
-                        if params.get("similarity_method") != "exact"
-                        else 1.0
-                    ),
-                    params.get("similarity_method", "tfidf"),
+                    group_data, ids, column, threshold, params.get("similarity_method", "tfidf")
                 )
                 if arr.shape[0] > 0:
                     column_results.extend(arr.tolist())
 
             if column_results:
-                similarity_results.append((column, column_results))
+                results.append((column, column_results))
 
-        self.similarity_results = similarity_results
+        self.similarity_results = results
 
-    def cluster_data(
-        self, old_label_map: Optional[Dict[object, str]] = None
-    ) -> pl.DataFrame:
-        # --- UPDATED: must-link only real (non-sentinel) labels ---
-        if old_label_map is not None:
+    def cluster_data(self, old_label_map: Optional[Dict[object, str]] = None) -> pl.DataFrame:
+        """
+        Build edges per self.conditions, apply must/cannot links, find components, and label.
+        If old_label_map is provided, inherit non-sentinel labels; otherwise emit numeric IDs.
+        """
+        # reset per-run state
+        self.graph.clear()
+        self.clusters.clear()
+
+        # must-link pairs that share a *non-sentinel* old label
+        if old_label_map:
             filtered = {n: lbl for n, lbl in old_label_map.items() if lbl not in self.unclustered_sentinels}
-            label_groups: Dict[str, List[object]] = defaultdict(list)
-            for node, lbl in filtered.items():
-                label_groups[lbl].append(node)
-            for _, node_list in label_groups.items():
-                for a, b in combinations(node_list, 2):
+            by_label: Dict[str, List[object]] = defaultdict(list)
+            for n, lbl in filtered.items():
+                by_label[lbl].append(n)
+            for _, nodes in by_label.items():
+                for a, b in combinations(nodes, 2):
                     self.must_links.add(_canonical_pair(a, b))
 
+        # edges from condition tree
         final_edges = self._compute_edges_for_condition(self.conditions)
 
-        # Apply must/cannot links
-        for a, b in self.must_links:
-            final_edges.add(_canonical_pair(a, b))
-        for a, b in list(final_edges):
-            if _canonical_pair(a, b) in self.cannot_links:
-                final_edges.discard(_canonical_pair(a, b))
+        # apply must/cannot
+        final_edges |= { _canonical_pair(a, b) for a, b in self.must_links }
+        final_edges -= { _canonical_pair(a, b) for a, b in self.cannot_links }
 
-        # Build graph
+        # materialize graph; include isolated nodes from current df
+        for node in self.df.get_column(self.id_col).to_list():
+            self.graph.setdefault(node, set())
         for a, b in final_edges:
             self.graph[a].add(b)
             self.graph[b].add(a)
 
-        # Find components
+        # find connected components
         self._find_clusters_from_graph()
 
-        # Assign labels
+        # build label frame
         id_dtype = self.df.schema[self.id_col]
-        # If inheriting from an old map we usually emit string labels; else numeric is fine.
-        cl_dtype = pl.Utf8 if old_label_map is not None else pl.Int64
+        cl_dtype = pl.Utf8 if (old_label_map or self.always_string_labels) else pl.Int64
 
-        if old_label_map is not None:
+        if old_label_map:
             node_to_label = self._derive_final_labels_with_old(self.clusters, old_label_map)
-            if node_to_label:
-                label_df = pl.DataFrame({
+            label_df = (
+                pl.DataFrame({
                     self.id_col: pl.Series(self.id_col, list(node_to_label.keys()), dtype=id_dtype),
                     "cluster_label": pl.Series("cluster_label", list(node_to_label.values()), dtype=cl_dtype),
                 })
-            else:
-                # empty but with correct schema
-                label_df = pl.DataFrame(schema={self.id_col: id_dtype, "cluster_label": cl_dtype})
+                if node_to_label else
+                pl.DataFrame(schema={self.id_col: id_dtype, "cluster_label": cl_dtype})
+            )
         else:
-            if self.clusters:
-                label_df = pl.DataFrame({
+            label_df = (
+                pl.DataFrame({
                     self.id_col: pl.Series(self.id_col, list(self.clusters.keys()), dtype=id_dtype),
                     "cluster_label": pl.Series("cluster_label", list(self.clusters.values()), dtype=cl_dtype),
                 })
-            else:
-                label_df = pl.DataFrame(schema={self.id_col: id_dtype, "cluster_label": cl_dtype})
+                if self.clusters else
+                pl.DataFrame(schema={self.id_col: id_dtype, "cluster_label": cl_dtype})
+            )
 
-        # Left-join; dtype-safe even when label_df is empty
         out = self.df.join(label_df, on=self.id_col, how="left")
 
-        # Fill unlabeled with fresh IDs/strings, using the chosen dtype
+        # fill unlabeled deterministically
         null_total = out.select(pl.col("cluster_label").is_null().sum().alias("n")).item()
         if null_total > 0:
             start = int(max([v for v in self.clusters.values()], default=-1)) + 1
@@ -390,89 +428,62 @@ class SimilarityMatrixGeneratorPolars:
                 .select("__rc__").to_series().to_list()
             )
 
-            if cl_dtype == pl.Utf8:
-                fill_vals = [f"new_{start + i}" for i in range(null_total)]
-            else:
-                fill_vals = [start + i for i in range(null_total)]
-
+            fill_vals = (
+                [f"new_{start + i}" for i in range(null_total)]
+                if cl_dtype == pl.Utf8
+                else [start + i for i in range(null_total)]
+            )
             fill_df = pl.DataFrame({
                 "__rc__": pl.Series("__rc__", null_rc, dtype=pl.Int64),
                 "__fill__": pl.Series("__fill__", fill_vals, dtype=cl_dtype),
             })
-
             out = (
                 out.join(fill_df, on="__rc__", how="left")
                 .with_columns(pl.coalesce([pl.col("cluster_label"), pl.col("__fill__")]).alias("cluster_label"))
                 .drop(["__fill__", "__rc__"])
             )
 
+        if self.always_string_labels:
+            out = out.with_columns(pl.col("cluster_label").cast(pl.Utf8))
+
         return out
 
-    # --- NEW: one-call incremental driver (uses self.df as "new data") ---
-    def incremental_cluster(self) -> pl.DataFrame:
+    def incremental_cluster(self, preclustered_df: Optional[pl.DataFrame]) -> pl.DataFrame:
         """
-        Incremental clustering:
-          - If a preclustered snapshot exists: load it, carry forward sentinels + singletons,
-            build must-links from non-sentinel labels, cluster, merge, and persist.
-          - Else: cluster self.df as first snapshot and persist (if enabled).
-        Returns the combined (old + new) clustered DataFrame.
+        Incrementally update an existing preclustered snapshot with the current batch (self.df).
+        Returns the **new snapshot** (combined old + this run’s results).
         """
-        import os
-
-        def _read_any(path: str) -> pl.DataFrame:
-            lower = path.lower()
-            if lower.endswith(".parquet"):
-                return pl.read_parquet(path)
-            elif lower.endswith(".csv"):
-                return pl.read_csv(path)
-            else:
-                return pl.read_parquet(path)
-
-        def _write_any(df: pl.DataFrame, path: str) -> None:
-            lower = path.lower()
-            if lower.endswith(".parquet"):
-                df.write_parquet(path)
-            elif lower.endswith(".csv"):
-                df.write_csv(path)
-            else:
-                df.write_parquet(path)
-
-        # First run (no snapshot): cluster new data and write if asked
-        if not self.preclustered_file_path or not os.path.exists(self.preclustered_file_path):
+        # no prior snapshot: cluster new and return it as the snapshot
+        if preclustered_df is None or preclustered_df.height == 0:
             clustered = self.cluster_data(old_label_map=None)
-            if self.persist_on_finish and self.preclustered_file_path:
-                _write_any(clustered, self.preclustered_file_path)
-            return clustered
+            return clustered.with_columns(pl.col("cluster_label").cast(pl.Utf8)) if self.always_string_labels else clustered
 
-        # Load old snapshot
-        old_all = _read_any(self.preclustered_file_path)
+        # harmonize dtypes with current batch
+        id_dtype = self.df.schema[self.id_col]
+        old_all = preclustered_df.with_columns(pl.col(self.id_col).cast(id_dtype))
+        if self.always_string_labels and "cluster_label" in old_all.columns:
+            old_all = old_all.with_columns(pl.col("cluster_label").cast(pl.Utf8))
         if "cluster_label" not in old_all.columns:
-            raise ValueError("preclustered file missing 'cluster_label' column.")
+            raise ValueError("preclustered_df must contain a 'cluster_label' column.")
 
-        # Ensure the same id_col is used
-        if self.id_col not in old_all.columns:
-            raise ValueError(f"id_col '{self.id_col}' not found in preclustered data.")
-
-        # Split old rows
-        is_sentinel = pl.col("cluster_label").is_in(list(self.unclustered_sentinels))
+        # sentinel mask & carry-forward set
+        is_sentinel = self._sentinel_mask_expr("cluster_label")
         old_un_sentinel = old_all.filter(is_sentinel)
 
-        # singletons (cluster size == 1)
-        counts = old_all.group_by("cluster_label").agg(pl.len().alias("n"))
-        old_all_with_n = old_all.join(counts, on="cluster_label", how="left")
-        old_singletons = old_all_with_n.filter(pl.col("n") == 1).drop("n")
-
-        # Carry-forward pool: sentinels + (optionally) singletons
-        carry_parts = [old_un_sentinel]
         if self.carry_forward_singletons:
-            carry_parts.append(old_singletons)
+            counts = old_all.group_by("cluster_label").agg(pl.len().alias("n"))
+            old_all_with_n = old_all.join(counts, on="cluster_label", how="left")
+            old_singletons = old_all_with_n.filter(pl.col("n") == 1).drop("n")
+            carry_parts = [old_un_sentinel, old_singletons]
+        else:
+            carry_parts = [old_un_sentinel]
+
         old_carry = (
             pl.concat(carry_parts, how="vertical_relaxed").unique(subset=[self.id_col])
-            if carry_parts
-            else pl.DataFrame(schema=old_all.schema)
+            if carry_parts else pl.DataFrame(schema=old_all.schema)
         )
 
-        # Build old_label_map from all non-sentinel labels
+        # build old label map (non-sentinels only)
         old_labeled = old_all.filter(~is_sentinel)
         old_label_map = dict(
             zip(
@@ -481,38 +492,43 @@ class SimilarityMatrixGeneratorPolars:
             )
         )
 
-        # Compose this run's working frame
+        # compose working frame for this run
         parts = [old_carry, self.df]
         if self.include_old_labeled_in_run:
-            parts.insert(0, old_labeled)
+            parts.insert(0, old_labeled)  # allow merges across existing clusters
         df_run = pl.concat(parts, how="vertical_relaxed").unique(subset=[self.id_col])
 
-        # Swap self.df -> df_run for this pass
-        prev_df = self.df
-        self.df = df_run
-        self.grouper = DataGrouperPolars(self.df, self.id_col)
+        # run clustering on the composed frame
+        prev_df, prev_grouper = self.df, self.grouper
+        try:
+            self.df = df_run
+            self.grouper = DataGrouperPolars(self.df, self.id_col)
+            clustered_run = self.cluster_data(old_label_map=old_label_map)
+            if self.always_string_labels:
+                clustered_run = clustered_run.with_columns(pl.col("cluster_label").cast(pl.Utf8))
+        finally:
+            self.df, self.grouper = prev_df, prev_grouper
 
-        clustered_run = self.cluster_data(old_label_map=old_label_map)
-
-        # Restore self.df to the new batch (optional)
-        self.df = prev_df
-        self.grouper = DataGrouperPolars(self.df, self.id_col)
-
-        # Merge: updated rows from run + untouched old rows not re-run
+        # merge clustered run back into untouched old rows
         run_ids = set(clustered_run.get_column(self.id_col).to_list())
         untouched_old = old_all.filter(~pl.col(self.id_col).is_in(list(run_ids)))
+
         combined = (
             pl.concat([untouched_old, clustered_run], how="vertical_relaxed")
             .unique(subset=[self.id_col], keep="last")
         )
+        return combined, clustered_run
 
-        if self.persist_on_finish:
-            _write_any(combined, self.preclustered_file_path)
-        return combined
+    # convenience alias if you prefer the original name
+    def fit_incremental_from_df(self, preclustered_df: Optional[pl.DataFrame]) -> pl.DataFrame:
+        return self.incremental_update(preclustered_df)
 
-    # ---- internals ----
+    # ---------------------------------------------------------------------
+    # Internals
+    # ---------------------------------------------------------------------
 
     def _extract_column_params(self, condition: Dict) -> Dict[str, Dict]:
+        """Collect leaf-level column param dicts from an AND/OR tree."""
         params: Dict[str, Dict] = {}
         if "and" in condition:
             for sub in condition["and"]:
@@ -525,44 +541,39 @@ class SimilarityMatrixGeneratorPolars:
                 params[col] = p
         return params
 
-    def _compute_edges_for_condition(
-        self, condition: Dict
-    ) -> Set[Tuple[object, object]]:
+    def _compute_edges_for_condition(self, condition: Dict) -> Set[Tuple[object, object]]:
+        """Compute edge set according to AND/OR composition of columns."""
         if "and" in condition:
             parts = [self._compute_edges_for_condition(c) for c in condition["and"]]
             return set.intersection(*parts) if parts else set()
-        elif "or" in condition:
+        if "or" in condition:
             parts = [self._compute_edges_for_condition(c) for c in condition["or"]]
             return set.union(*parts) if parts else set()
-        else:
-            edges_per_col = []
-            for col, params in condition.items():
-                edges_per_col.append(self._compute_edges_for_single_column(col, params))
-            return set.intersection(*edges_per_col) if edges_per_col else set()
 
-    def _compute_edges_for_single_column(
-        self, column: str, params: Dict
-    ) -> Set[Tuple[object, object]]:
-        threshold = params.get("threshold", 0.8)
+        edges_per_col = [
+            self._compute_edges_for_single_column(col, params)
+            for col, params in condition.items()
+        ]
+        return set.intersection(*edges_per_col) if edges_per_col else set()
+
+    def _compute_edges_for_single_column(self, column: str, params: Dict) -> Set[Tuple[object, object]]:
+        threshold = 1.0 if params.get("similarity_method") == "exact" else params.get("threshold", 0.8)
         method = params.get("similarity_method", "tfidf")
-        if method == "exact":
-            threshold = 1.0
 
         groups = self.grouper.group_dataframe(params, column)
         all_pairs: Set[Tuple[object, object]] = set()
 
-        for group in tqdm(groups, desc=f"Matching within blocks for '{column}'"):
+        for group in tqdm(groups, desc=f"Matching within blocks for '{column}'", leave=False):
             ids = group[self.id_col].to_list()
             texts = group[column].cast(pl.Utf8).to_list()
             data = self.sim_calc.initialize_vectorizer(method, texts)
-            arr = self.sim_calc.create_similarity_matrix(
-                data, ids, column, threshold, method
-            )
+            arr = self.sim_calc.create_similarity_matrix(data, ids, column, threshold, method)
             for a, b, _ in arr:
                 all_pairs.add(_canonical_pair(a, b))
         return all_pairs
 
     def _find_clusters_from_graph(self) -> None:
+        """Simple BFS over the undirected graph to assign component IDs."""
         visited: Set[object] = set()
         comp_id = 0
         for node in self.graph.keys():
@@ -583,7 +594,11 @@ class SimilarityMatrixGeneratorPolars:
     def _derive_final_labels_with_old(
         self, clusters: Dict[object, int], old_map: Dict[object, str]
     ) -> Dict[object, str]:
-        # --- UPDATED: ignore sentinel labels while inheriting ---
+        """
+        If a component intersects exactly one non-sentinel old label => inherit that label.
+        If it intersects multiple labels => join them (sorted) with '_'.
+        Else => assign "new_{cid}".
+        """
         comp_to_nodes: Dict[int, List[object]] = defaultdict(list)
         for node, cid in clusters.items():
             comp_to_nodes[cid].append(node)
@@ -604,100 +619,16 @@ class SimilarityMatrixGeneratorPolars:
 
         return {node: comp_label[cid] for node, cid in clusters.items()}
 
+    def _sentinel_mask_expr(self, col: str) -> pl.Expr:
+        """
+        Robust sentinel detection across mixed dtypes:
+        - treat null as sentinel
+        - compare non-null values via string form against normalized sentinel set
+        """
+        sent_strs = {str(s) for s in self.unclustered_sentinels if s is not None}
+        return pl.col(col).is_null() | pl.col(col).cast(pl.Utf8, strict=False).is_in(sorted(sent_strs))
 
-    # ---- internals ----
 
-    def _extract_column_params(self, condition: Dict) -> Dict[str, Dict]:
-        params: Dict[str, Dict] = {}
-        if "and" in condition:
-            for sub in condition["and"]:
-                params.update(self._extract_column_params(sub))
-        elif "or" in condition:
-            for sub in condition["or"]:
-                params.update(self._extract_column_params(sub))
-        else:
-            for col, p in condition.items():
-                params[col] = p
-        return params
-
-    def _compute_edges_for_condition(
-        self, condition: Dict
-    ) -> Set[Tuple[object, object]]:
-        if "and" in condition:
-            parts = [self._compute_edges_for_condition(c) for c in condition["and"]]
-            return set.intersection(*parts) if parts else set()
-        elif "or" in condition:
-            parts = [self._compute_edges_for_condition(c) for c in condition["or"]]
-            return set.union(*parts) if parts else set()
-        else:
-            # leaf: one or more columns (AND by default)
-            edges_per_col = []
-            for col, params in condition.items():
-                edges_per_col.append(self._compute_edges_for_single_column(col, params))
-            return set.intersection(*edges_per_col) if edges_per_col else set()
-
-    def _compute_edges_for_single_column(
-        self, column: str, params: Dict
-    ) -> Set[Tuple[object, object]]:
-        threshold = params.get("threshold", 0.8)
-        method = params.get("similarity_method", "tfidf")
-        if method == "exact":
-            threshold = 1.0
-
-        groups = self.grouper.group_dataframe(params, column)
-        all_pairs: Set[Tuple[object, object]] = set()
-
-        for group in tqdm(groups, desc=f"Matching within blocks for '{column}'"):
-            ids = group[self.id_col].to_list()
-            texts = group[column].cast(pl.Utf8).to_list()
-            data = self.sim_calc.initialize_vectorizer(method, texts)
-            arr = self.sim_calc.create_similarity_matrix(
-                data, ids, column, threshold, method
-            )
-            for a, b, _ in arr:
-                all_pairs.add(_canonical_pair(a, b))
-        return all_pairs
-
-    def _find_clusters_from_graph(self) -> None:
-        visited: Set[object] = set()
-        comp_id = 0
-        for node in self.graph.keys():
-            if node in visited:
-                continue
-            # BFS
-            q = deque([node])
-            while q:
-                u = q.popleft()
-                if u in visited:
-                    continue
-                visited.add(u)
-                self.clusters[u] = comp_id
-                for v in self.graph[u]:
-                    if v not in visited:
-                        q.append(v)
-            comp_id += 1
-
-    def _derive_final_labels_with_old(
-        self, clusters: Dict[object, int], old_map: Dict[object, str]
-    ) -> Dict[object, str]:
-        comp_to_nodes: Dict[int, List[object]] = defaultdict(list)
-        for node, cid in clusters.items():
-            comp_to_nodes[cid].append(node)
-
-        comp_label: Dict[int, str] = {}
-        for cid, nodes in comp_to_nodes.items():
-            old_labels = {old_map[n] for n in nodes if n in old_map}
-            if len(old_labels) == 1:
-                comp_label[cid] = list(old_labels)[0]
-            elif len(old_labels) > 1:
-                comp_label[cid] = "_".join(sorted(old_labels))
-            else:
-                comp_label[cid] = f"new_{cid}"
-
-        node_to_label: Dict[object, str] = {}
-        for node, cid in clusters.items():
-            node_to_label[node] = comp_label[cid]
-        return node_to_label
 
 
 # -----------------------------
