@@ -44,8 +44,7 @@ def _ensure_id_col(df: pl.DataFrame, id_col: Optional[str]) -> Tuple[pl.DataFram
             raise ValueError(
                 "id_col not provided and '_id' already exists in DataFrame."
             )
-        # Force Int64 instead of default u32
-        df = df.with_row_count("_id", dtype=pl.Int64)
+        df = df.with_row_count("_id")
         return df, "_id"
     if id_col not in df.columns:
         raise ValueError(f"id_col '{id_col}' not found in DataFrame.")
@@ -371,21 +370,37 @@ class SimilarityMatrixGeneratorPolars:
         if null_total > 0:
             start = int(max([v for v in self.clusters.values()], default=-1)) + 1
 
-            # Force Int64 here too
-            out = out.with_row_count("__rc__", dtype=pl.Int64)
+            # stable row counter + force Int64 so join keys match
+            out = out.with_row_count("__rc__").with_columns(
+                pl.col("__rc__").cast(pl.Int64)
+            )
 
+            # which rows need fills?
             null_rc = (
                 out.filter(pl.col("cluster_label").is_null())
                 .select("__rc__")
                 .to_series()
                 .to_list()
             )
-            fill_vals = [start + i for i in range(null_total)]
+
+            # match fill dtype to existing cluster_label dtype
+            cl_dtype = out.schema.get("cluster_label", pl.Null)
+            if cl_dtype == pl.Utf8:
+                fill_series = pl.Series(
+                    "__fill__",
+                    [f"new_{start + i}" for i in range(null_total)],
+                    dtype=pl.Utf8,
+                )
+            else:
+                # keep numeric; if existing labels are numeric but not Int64, you can cast them before coalesce if needed
+                fill_series = pl.Series(
+                    "__fill__", [start + i for i in range(null_total)], dtype=pl.Int64
+                )
 
             fill_df = pl.DataFrame(
                 {
                     "__rc__": pl.Series("__rc__", null_rc, dtype=pl.Int64),
-                    "__fill__": pl.Series("__fill__", fill_vals, dtype=pl.Int64),
+                    "__fill__": fill_series,
                 }
             )
 
@@ -398,6 +413,7 @@ class SimilarityMatrixGeneratorPolars:
                 )
                 .drop(["__fill__", "__rc__"])
             )
+
         return out
 
     # ---- internals ----
