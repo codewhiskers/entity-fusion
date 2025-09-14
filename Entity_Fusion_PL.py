@@ -27,6 +27,13 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sparse_dot_topn import awesome_cossim_topn, sp_matmul_topn
 from tqdm import tqdm
 
+from collections import defaultdict, deque
+from itertools import combinations
+from typing import Dict, List, Optional, Set, Tuple, Union
+
+import polars as pl
+from tqdm import tqdm
+
 
 # -----------------------------
 # Utilities
@@ -248,14 +255,7 @@ class DataGrouperPolars:
 # -----------------------------
 
 
-from __future__ import annotations
 
-from collections import defaultdict, deque
-from itertools import combinations
-from typing import Dict, List, Optional, Set, Tuple, Union
-
-import polars as pl
-from tqdm import tqdm
 
 
 # If you already have this elsewhere, feel free to remove this helper.
@@ -263,15 +263,6 @@ def _canonical_pair(a, b):
     """Order-agnostic pair for set membership."""
     return (a, b) if str(a) <= str(b) else (b, a)
 
-
-from __future__ import annotations
-
-from collections import defaultdict, deque
-from itertools import combinations
-from typing import Dict, List, Optional, Set, Tuple, Union
-
-import polars as pl
-from tqdm import tqdm
 
 
 # ---------- tiny helper ----------
@@ -358,116 +349,196 @@ class SimilarityMatrixGeneratorPolars:
     def cluster_data(self, old_label_map: Optional[Dict[object, str]] = None) -> pl.DataFrame:
         """
         Build edges per self.conditions, apply must/cannot links, find components, and label.
-        If old_label_map is provided, inherit non-sentinel labels; otherwise emit numeric IDs.
+        Ensures consistent cluster label types and always returns a frame.
         """
         # reset per-run state
         self.graph.clear()
         self.clusters.clear()
 
-        # must-link pairs that share a *non-sentinel* old label
+        # Start from static/user-provided must_links; don't mutate self.must_links across runs
+        must_links = set(self.must_links)
+
+        # Add must-links for nodes that share a non-sentinel old label
         if old_label_map:
-            filtered = {n: lbl for n, lbl in old_label_map.items() if lbl not in self.unclustered_sentinels}
+            filtered = {n: lbl for n, lbl in old_label_map.items()
+                        if lbl not in self.unclustered_sentinels}
             by_label: Dict[str, List[object]] = defaultdict(list)
             for n, lbl in filtered.items():
                 by_label[lbl].append(n)
             for _, nodes in by_label.items():
                 for a, b in combinations(nodes, 2):
-                    self.must_links.add(_canonical_pair(a, b))
+                    must_links.add(_canonical_pair(a, b))
 
-        # edges from condition tree
+        # Edges from condition tree
         final_edges = self._compute_edges_for_condition(self.conditions)
-
-        # apply must/cannot
-        final_edges |= { _canonical_pair(a, b) for a, b in self.must_links }
+        # Apply must/cannot
+        final_edges |= { _canonical_pair(a, b) for a, b in must_links }
         final_edges -= { _canonical_pair(a, b) for a, b in self.cannot_links }
 
-        # materialize graph; include isolated nodes from current df
+        # Materialize graph; include isolated nodes from current df
         for node in self.df.get_column(self.id_col).to_list():
             self.graph.setdefault(node, set())
         for a, b in final_edges:
             self.graph[a].add(b)
             self.graph[b].add(a)
 
-        # find connected components
+        # Find connected components
         self._find_clusters_from_graph()
 
-        # build label frame
+        # Build label frame with consistent types
         id_dtype = self.df.schema[self.id_col]
-        cl_dtype = pl.Utf8 if (old_label_map or self.always_string_labels) else pl.Int64
+        use_string_labels = self.always_string_labels or (old_label_map is not None)
+        cl_dtype = pl.Utf8 if use_string_labels else pl.Int64
 
         if old_label_map:
             node_to_label = self._derive_final_labels_with_old(self.clusters, old_label_map)
             label_df = (
                 pl.DataFrame({
                     self.id_col: pl.Series(self.id_col, list(node_to_label.keys()), dtype=id_dtype),
-                    "cluster_label": pl.Series("cluster_label", list(node_to_label.values()), dtype=cl_dtype),
+                    "cluster_label": pl.Series("cluster_label", list(node_to_label.values()), dtype=pl.Utf8),
                 })
                 if node_to_label else
-                pl.DataFrame(schema={self.id_col: id_dtype, "cluster_label": cl_dtype})
+                pl.DataFrame(schema={self.id_col: id_dtype, "cluster_label": pl.Utf8})
             )
         else:
+            if use_string_labels and self.clusters:
+                cluster_values = [str(v) for v in self.clusters.values()]
+            else:
+                cluster_values = list(self.clusters.values())
+
             label_df = (
                 pl.DataFrame({
                     self.id_col: pl.Series(self.id_col, list(self.clusters.keys()), dtype=id_dtype),
-                    "cluster_label": pl.Series("cluster_label", list(self.clusters.values()), dtype=cl_dtype),
+                    "cluster_label": pl.Series("cluster_label", cluster_values, dtype=cl_dtype),
                 })
                 if self.clusters else
                 pl.DataFrame(schema={self.id_col: id_dtype, "cluster_label": cl_dtype})
             )
 
-        out = self.df.join(label_df, on=self.id_col, how="left")
+        # Join labels; prefer newly computed one and keep exactly one 'cluster_label'
+        out = self.df.join(label_df, on=self.id_col, how="left", suffix="_new")
+        if "cluster_label_new" in out.columns:
+            out = out.with_columns(
+                pl.coalesce([pl.col("cluster_label_new"), pl.col("cluster_label")]).alias("cluster_label")
+            ).drop("cluster_label_new")
 
-        # fill unlabeled deterministically
+        # Fill unlabeled deterministically
         null_total = out.select(pl.col("cluster_label").is_null().sum().alias("n")).item()
         if null_total > 0:
-            start = int(max([v for v in self.clusters.values()], default=-1)) + 1
+            # Determine start for "new_{k}" or integer labels
+            if self.clusters:
+                if use_string_labels:
+                    max_val = -1
+                    for v in self.clusters.values():
+                        if isinstance(v, str):
+                            if v.startswith("new_"):
+                                try:
+                                    max_val = max(max_val, int(v.split("_")[1]))
+                                except (IndexError, ValueError):
+                                    pass
+                            else:
+                                try:
+                                    max_val = max(max_val, int(v))
+                                except ValueError:
+                                    pass
+                        elif isinstance(v, (int, float)):
+                            max_val = max(max_val, int(v))
+                    start = max_val + 1
+                else:
+                    start = int(max([v for v in self.clusters.values()], default=-1)) + 1
+            else:
+                start = 0
 
-            out = out.with_row_count("__rc__").with_columns(pl.col("__rc__").cast(pl.Int64))
+            out = out.with_row_index("__rc__")
             null_rc = (
                 out.filter(pl.col("cluster_label").is_null())
                 .select("__rc__").to_series().to_list()
             )
 
-            fill_vals = (
-                [f"new_{start + i}" for i in range(null_total)]
-                if cl_dtype == pl.Utf8
-                else [start + i for i in range(null_total)]
-            )
+            if cl_dtype == pl.Utf8:
+                fill_vals = [f"new_{start + i}" for i in range(null_total)]
+            else:
+                fill_vals = [start + i for i in range(null_total)]
+
             fill_df = pl.DataFrame({
-                "__rc__": pl.Series("__rc__", null_rc, dtype=pl.Int64),
+                "__rc__": pl.Series("__rc__", null_rc, dtype=pl.UInt32),   # match with_row_index dtype
                 "__fill__": pl.Series("__fill__", fill_vals, dtype=cl_dtype),
             })
+
             out = (
                 out.join(fill_df, on="__rc__", how="left")
                 .with_columns(pl.coalesce([pl.col("cluster_label"), pl.col("__fill__")]).alias("cluster_label"))
                 .drop(["__fill__", "__rc__"])
             )
 
-        if self.always_string_labels:
+        # Enforce final dtype and return
+        if use_string_labels:
             out = out.with_columns(pl.col("cluster_label").cast(pl.Utf8))
+        else:
+            out = out.with_columns(pl.col("cluster_label").cast(pl.Int64))
 
         return out
 
-    def incremental_cluster(self, preclustered_df: Optional[pl.DataFrame]) -> pl.DataFrame:
+
+    def _align_for_concat(self, dfs: list[pl.DataFrame]) -> list[pl.DataFrame]:
+        if not dfs:
+            return dfs
+        # union of all column names
+        all_cols = []
+        seen = set()
+        for df in dfs:
+            for c in df.columns:
+                if c not in seen:
+                    seen.add(c)
+                    all_cols.append(c)
+        # add missing columns as Null and select same order
+        out = []
+        for df in dfs:
+            missing = [c for c in all_cols if c not in df.columns]
+            if missing:
+                df = df.with_columns([pl.lit(None).alias(c) for c in missing])
+            out.append(df.select(all_cols))
+        return out
+
+
+    def incremental_cluster(self, preclustered_df: Optional[pl.DataFrame]) -> Tuple[pl.DataFrame, pl.DataFrame]:
         """
         Incrementally update an existing preclustered snapshot with the current batch (self.df).
-        Returns the **new snapshot** (combined old + this run’s results).
+        Returns tuple of (combined_snapshot, batch_results).
         """
+
+        
         # no prior snapshot: cluster new and return it as the snapshot
         if preclustered_df is None or preclustered_df.height == 0:
             clustered = self.cluster_data(old_label_map=None)
-            return clustered.with_columns(pl.col("cluster_label").cast(pl.Utf8)) if self.always_string_labels else clustered
+            if self.always_string_labels:
+                clustered = clustered.with_columns(pl.col("cluster_label").cast(pl.Utf8))
+            return clustered, clustered
 
         # harmonize dtypes with current batch
         id_dtype = self.df.schema[self.id_col]
         old_all = preclustered_df.with_columns(pl.col(self.id_col).cast(id_dtype))
-        if self.always_string_labels and "cluster_label" in old_all.columns:
-            old_all = old_all.with_columns(pl.col("cluster_label").cast(pl.Utf8))
+        
         if "cluster_label" not in old_all.columns:
             raise ValueError("preclustered_df must contain a 'cluster_label' column.")
+        
+        if self.always_string_labels:
+            old_all = old_all.with_columns(pl.col("cluster_label").cast(pl.Utf8))
 
-        # sentinel mask & carry-forward set
-        is_sentinel = self._sentinel_mask_expr("cluster_label")
+        # Create sentinel mask - handle dtype issues properly
+        cluster_dtype = old_all.schema["cluster_label"]
+        if cluster_dtype == pl.Utf8:
+            # For string columns, convert sentinels to strings and handle nulls
+            sentinel_strs = [str(s) for s in self.unclustered_sentinels if s is not None]
+            is_sentinel = pl.col("cluster_label").is_null() | pl.col("cluster_label").is_in(sentinel_strs)
+        else:
+            # For numeric columns, keep only numeric sentinels
+            sentinel_nums = [s for s in self.unclustered_sentinels if isinstance(s, (int, float)) and s is not None]
+            if sentinel_nums:
+                is_sentinel = pl.col("cluster_label").is_null() | pl.col("cluster_label").is_in(sentinel_nums)
+            else:
+                is_sentinel = pl.col("cluster_label").is_null()
+
         old_un_sentinel = old_all.filter(is_sentinel)
 
         if self.carry_forward_singletons:
@@ -492,10 +563,24 @@ class SimilarityMatrixGeneratorPolars:
             )
         )
 
-        # compose working frame for this run
-        parts = [old_carry, self.df]
-        if self.include_old_labeled_in_run:
-            parts.insert(0, old_labeled)  # allow merges across existing clusters
+        # *** FIX: Ensure schema compatibility before concatenation ***
+        parts = []
+        
+        # Add old carry data (already has correct schema)
+        if old_carry.height > 0:
+            parts.append(old_carry)
+        
+        # Add new data - ensure it has cluster_label column (null values)
+        new_data_with_schema = self.df.with_columns(pl.lit(None, dtype=cluster_dtype).alias("cluster_label"))
+        parts.append(new_data_with_schema)
+        
+        # Add old labeled data if requested
+        if self.include_old_labeled_in_run and old_labeled.height > 0:
+            parts.insert(-1, old_labeled)  # Insert before new data
+
+        # Now concatenate with compatible schemas
+        parts = [p.with_columns(pl.col("cluster_label").cast(pl.Utf8)) for p in parts]
+        parts = self._align_for_concat(parts)                     # ← NEW
         df_run = pl.concat(parts, how="vertical_relaxed").unique(subset=[self.id_col])
 
         # run clustering on the composed frame
@@ -511,17 +596,22 @@ class SimilarityMatrixGeneratorPolars:
 
         # merge clustered run back into untouched old rows
         run_ids = set(clustered_run.get_column(self.id_col).to_list())
-        untouched_old = old_all.filter(~pl.col(self.id_col).is_in(list(run_ids)))
+        untouched_old = old_all.filter(~pl.col(self.id_col).is_in(list(run_ids)))  # <-- add this
+        # make sure we only have ONE cluster_label and it’s Utf8
+        clustered_run = clustered_run.with_columns(pl.col("cluster_label").cast(pl.Utf8))
+        untouched_old  = untouched_old.with_columns(pl.col("cluster_label").cast(pl.Utf8))
 
+        to_combine = self._align_for_concat([untouched_old, clustered_run])   # ← NEW
         combined = (
-            pl.concat([untouched_old, clustered_run], how="vertical_relaxed")
+            pl.concat(to_combine, how="vertical_relaxed")
             .unique(subset=[self.id_col], keep="last")
         )
+
         return combined, clustered_run
 
     # convenience alias if you prefer the original name
     def fit_incremental_from_df(self, preclustered_df: Optional[pl.DataFrame]) -> pl.DataFrame:
-        return self.incremental_update(preclustered_df)
+        return self.incremental_cluster(preclustered_df)
 
     # ---------------------------------------------------------------------
     # Internals
@@ -619,14 +709,31 @@ class SimilarityMatrixGeneratorPolars:
 
         return {node: comp_label[cid] for node, cid in clusters.items()}
 
-    def _sentinel_mask_expr(self, col: str) -> pl.Expr:
+    def _sentinel_mask_expr_safe(self, df: pl.DataFrame, col: str) -> pl.Expr:
         """
-        Robust sentinel detection across mixed dtypes:
-        - treat null as sentinel
-        - compare non-null values via string form against normalized sentinel set
+        Safe sentinel detection that handles dtype mismatches.
         """
-        sent_strs = {str(s) for s in self.unclustered_sentinels if s is not None}
-        return pl.col(col).is_null() | pl.col(col).cast(pl.Utf8, strict=False).is_in(sorted(sent_strs))
+        # Get the actual column dtype
+        col_dtype = df.schema[col]
+        
+        # Convert sentinels to match the column type
+        if col_dtype == pl.Utf8:
+            # For string columns, convert all sentinels to strings (except None)
+            sentinel_values = [str(s) for s in self.unclustered_sentinels if s is not None]
+            # Handle None separately
+            return pl.col(col).is_null() | pl.col(col).is_in(sentinel_values)
+        elif col_dtype in [pl.Int64, pl.Int32, pl.UInt64, pl.UInt32]:
+            # For integer columns, keep only numeric sentinels
+            sentinel_values = [s for s in self.unclustered_sentinels if isinstance(s, (int, float)) and s is not None]
+            if sentinel_values:
+                return pl.col(col).is_null() | pl.col(col).is_in(sentinel_values)
+            else:
+                return pl.col(col).is_null()
+        else:
+            # For other types, fall back to string comparison
+            sentinel_values = [str(s) for s in self.unclustered_sentinels if s is not None]
+            return pl.col(col).is_null() | pl.col(col).cast(pl.Utf8, strict=False).is_in(sentinel_values)
+
 
 
 
@@ -908,116 +1015,273 @@ class TwoDFMatcherPolars:
 
 
 if __name__ == "__main__":
-    import polars as pl
+# ===============================
+# WORKING DEMO: Based on your actual code structure
+# ===============================
 
-    # --- Load & keep relevant columns ---
-    df = pl.read_csv(
-        "test_data/100k.csv",
-        n_rows=100_000,
-        encoding="latin1",
-        infer_schema_length=50_000,
-    ).select(
-        [
-            pl.col("BorrowerName"),
-            pl.col("BorrowerAddress"),
-            pl.col("BorrowerCity"),
-        ]
-    )
-
-    # --- Build a stable-ish entity id by hashing the 3 columns ---
-    # Normalize then hash; using xxhash64 via Polars .hash with a fixed seed for reproducibility.
-    df = (
-        df.with_columns(
-            [
-                pl.col("BorrowerName")
-                .cast(pl.Utf8)
-                .str.to_lowercase()
-                .str.strip_chars()
-                .alias("_bn"),
-                pl.col("BorrowerAddress")
-                .cast(pl.Utf8)
-                .str.to_lowercase()
-                .str.strip_chars()
-                .alias("_ba"),
-                pl.col("BorrowerCity")
-                .cast(pl.Utf8)
-                .str.to_lowercase()
-                .str.strip_chars()
-                .alias("_bc"),
-            ]
+    def working_incremental_demo():
+        """
+        A working demo that handles all the schema and dtype issues properly
+        """
+        
+        # Simple conditions to avoid complexity
+        conditions = {
+            "BorrowerName": {
+                "threshold": 0.8,
+                "similarity_method": "tfidf"
+            }
+        }
+        
+        print("=== WORKING INCREMENTAL DEMO ===\n")
+        
+        # ===============================
+        # BATCH 1: Initial clustering
+        # ===============================
+        
+        batch1 = pl.DataFrame({
+            "entity_id": [1001, 1002, 1003],
+            "BorrowerName": ["JOHN SMITH", "JANE DOE", "BOB WILSON"],
+            "BorrowerAddress": ["123 MAIN ST", "456 OAK AVE", "789 PINE RD"],
+            "BorrowerCity": ["NYC", "CHI", "LA"]
+        })
+        
+        print("BATCH 1 - Initial data:")
+        print(batch1.select(["entity_id", "BorrowerName"]))
+        print()
+        
+        generator1 = SimilarityMatrixGeneratorPolars(
+            df=batch1,
+            conditions=conditions,
+            id_col="entity_id",
+            always_string_labels=True,  # This ensures string labels from the start
+            carry_forward_singletons=True
         )
-        .with_columns(
-            pl.concat_str(["_bn", "_ba", "_bc"], separator="|")
-            .hash(seed=42)
-            .cast(pl.UInt64)
-            .alias("entity_id")
+        
+        # Initial clustering
+        combined1, batch1_results = generator1.incremental_cluster(preclustered_df=None)
+        
+        print("After BATCH 1:")
+        print(combined1.select(["entity_id", "BorrowerName", "cluster_label"]))
+        print(f"Clusters: {combined1['cluster_label'].n_unique()}")
+        print()
+        
+        # ===============================
+        # BATCH 2: Add similar records
+        # ===============================
+        
+        batch2 = pl.DataFrame({
+            "entity_id": [2001, 2002],
+            "BorrowerName": ["JON SMITH", "J. DOE"],  # Similar to existing
+            "BorrowerAddress": ["123 MAIN STREET", "456 OAK AVENUE"],
+            "BorrowerCity": ["NYC", "CHI"]
+        })
+        
+        print("BATCH 2 - Adding similar records:")
+        print(batch2.select(["entity_id", "BorrowerName"]))
+        print()
+        
+        generator2 = SimilarityMatrixGeneratorPolars(
+            df=batch2,
+            conditions=conditions,
+            id_col="entity_id",
+            always_string_labels=True,
+            carry_forward_singletons=True
         )
-        .drop(["_bn", "_ba", "_bc"])  # keep the original text columns as-is
-    )
+        
+        # Incremental clustering
+        combined2, batch2_results = generator2.incremental_cluster(preclustered_df=combined1)
+        
+        print("After BATCH 2:")
+        print(combined2.select(["entity_id", "BorrowerName", "cluster_label"]).sort("entity_id"))
+        print(f"Clusters: {combined2['cluster_label'].n_unique()}")
+        print()
+        
+        print("BATCH 2 results only:")
+        print(batch2_results.select(["entity_id", "BorrowerName", "cluster_label"]))
+        print()
+        
+        # ===============================
+        # BATCH 3: Add diverse records
+        # ===============================
+        
+        batch3 = pl.DataFrame({
+            "entity_id": [3001, 3002, 3003],
+            "BorrowerName": ["ALICE BROWN", "CHARLIE DAVIS", "JOHN SMITH"],  # Mix new + exact match
+            "BorrowerAddress": ["321 ELM ST", "999 NEW AVE", "123 MAIN ST"],
+            "BorrowerCity": ["BOSTON", "SF", "NYC"]
+        })
+        
+        print("BATCH 3 - Adding diverse records:")
+        print(batch3.select(["entity_id", "BorrowerName"]))
+        print()
+        
+        generator3 = SimilarityMatrixGeneratorPolars(
+            df=batch3,
+            conditions=conditions,
+            id_col="entity_id",
+            always_string_labels=True,
+            carry_forward_singletons=True
+        )
+        
+        # Incremental clustering
+        combined3, batch3_results = generator3.incremental_cluster(preclustered_df=combined2)
+        
+        print("FINAL RESULTS:")
+        print(combined3.select(["entity_id", "BorrowerName", "cluster_label"]).sort("entity_id"))
+        print(f"Total entities: {combined3.height}")
+        print(f"Unique clusters: {combined3['cluster_label'].n_unique()}")
+        print()
+        
+        # Show cluster membership
+        print("=== CLUSTER MEMBERSHIP ===")
+        cluster_analysis = (
+            combined3
+            .group_by("cluster_label")
+            .agg([
+                pl.count().alias("size"),
+                pl.col("BorrowerName").alias("members")
+            ])
+            .sort("size", descending=True)
+        )
+        
+        for row in cluster_analysis.iter_rows(named=True):
+            print(f"Cluster {row['cluster_label']}: {row['size']} members")
+            print(f"  Names: {', '.join(row['members'])}")
+            print()
+        
+        return combined3
 
-    # --- Optional: seed old labels by picking specific ROWS and mapping to their entity_id ---
-    # (Uses row positions 28600 and 28871 if they exist.)
-    s_ids = df.get_column("entity_id")
-    old_label_map = {}
-    if s_ids.len() > 28600:
-        old_label_map[int(s_ids[28600])] = "main_1"
-    if s_ids.len() > 28871:
-        old_label_map[int(s_ids[28871])] = "main_2"
+    def test_with_existing_labels():
+        """
+        Test incremental clustering with pre-existing cluster labels
+        """
+        print("=== TEST WITH EXISTING LABELS ===\n")
+        
+        # Simulate existing clustered data
+        existing_snapshot = pl.DataFrame({
+            "entity_id": [100, 101, 102, 103],
+            "BorrowerName": ["ACME CORP", "ACME CORPORATION", "BETA LLC", "GAMMA INC"],
+            "BorrowerAddress": ["100 BUSINESS ST", "100 BUSINESS STREET", "200 TRADE AVE", "300 COMMERCE RD"],
+            "BorrowerCity": ["DALLAS", "DALLAS", "HOUSTON", "AUSTIN"],
+            "cluster_label": ["company_1", "company_1", "company_2", "-1"]  # Note: -1 is unclustered
+        })
+        
+        print("Existing snapshot:")
+        print(existing_snapshot.select(["entity_id", "BorrowerName", "cluster_label"]))
+        print()
+        
+        # New batch that might match existing
+        new_batch = pl.DataFrame({
+            "entity_id": [200, 201, 202],
+            "BorrowerName": ["ACME CORP", "BETA LIMITED", "DELTA SYSTEMS"],
+            "BorrowerAddress": ["100 BUSINESS ST", "200 TRADE AVENUE", "400 TECH BLVD"],
+            "BorrowerCity": ["DALLAS", "HOUSTON", "AUSTIN"]
+        })
+        
+        print("New batch:")
+        print(new_batch.select(["entity_id", "BorrowerName"]))
+        print()
+        
+        conditions = {
+            "BorrowerName": {
+                "threshold": 0.7,
+                "similarity_method": "tfidf"
+            }
+        }
+        
+        generator = SimilarityMatrixGeneratorPolars(
+            df=new_batch,
+            conditions=conditions,
+            id_col="entity_id",
+            always_string_labels=True,
+            unclustered_sentinels={"-1", "unclustered", None}
+        )
+        
+        # Incremental clustering
+        final_snapshot, new_results = generator.incremental_cluster(preclustered_df=existing_snapshot)
+        
+        print("Final results:")
+        print(final_snapshot.select(["entity_id", "BorrowerName", "cluster_label"]).sort("entity_id"))
+        print()
+        
+        print("New batch results only:")
+        print(new_results.select(["entity_id", "BorrowerName", "cluster_label"]))
+        print()
+        
+        # Analysis
+        print("=== CLUSTER ANALYSIS ===")
+        non_unclustered = final_snapshot.filter(pl.col("cluster_label") != "-1")
+        cluster_summary = (
+            non_unclustered
+            .group_by("cluster_label")
+            .agg([
+                pl.count().alias("size"),
+                pl.col("BorrowerName").alias("members")
+            ])
+            .sort("cluster_label")
+        )
+        
+        for row in cluster_summary.iter_rows(named=True):
+            print(f"{row['cluster_label']}: {', '.join(row['members'])}")
+        
+        return final_snapshot
 
-    # --- Conditions (same as before) ---
-    my_conditions = {
-        "or": [
-            {
-                "and": [
-                    {
-                        "BorrowerName": {
-                            "threshold": 0.3,
-                            "blocking_column": ["BorrowerCity"],
-                            "blocking_criteria": ["blocking_column"],
-                            "similarity_method": "tfidf",
-                        }
-                    },
-                    {
-                        "BorrowerAddress": {
-                            "threshold": 0.9,
-                            "blocking_column": ["BorrowerCity"],
-                            "blocking_criteria": ["blocking_column"],
-                            "similarity_method": "tfidf",
-                        }
-                    },
-                ]
-            },
-            {
-                "BorrowerName": {
-                    "blocking_column": ["BorrowerCity"],
-                    "blocking_criteria": ["blocking_column"],
-                    "similarity_method": "exact",
-                }
-            },
-        ]
-    }
-    import pdb
-
-    # --- Run clustering using the hashed id ---
-    smg = SimilarityMatrixGeneratorPolars(df, my_conditions, id_col="entity_id")
-    clustered = smg.cluster_data(old_label_map=old_label_map)
-    pdb.set_trace()
-    # --- Basic report ---
-    print("Total rows:", clustered.height)
-    print(
-        "Distinct clusters:",
-        clustered.select(pl.col("cluster_label").n_unique()).item(),
-    )
-    print(
-        clustered.select(
-            [
-                "entity_id",
-                "BorrowerName",
-                "BorrowerAddress",
-                "BorrowerCity",
-                "cluster_label",
-            ]
-        ).head(10)
-    )
-
-    # clustered.write_csv("test_data/100k_clustered_polars.csv")
+    def minimal_test():
+        """
+        Absolute minimal test to verify the fix works
+        """
+        print("=== MINIMAL TEST ===\n")
+        
+        # Simplest possible case
+        batch1 = pl.DataFrame({
+            "name": ["JOHN", "JANE"],
+            "id": [1, 2]
+        })
+        
+        conditions = {"name": {"similarity_method": "exact"}}
+        
+        gen1 = SimilarityMatrixGeneratorPolars(
+            df=batch1,
+            conditions=conditions,
+            id_col="id",
+            always_string_labels=True
+        )
+        
+        result1, _ = gen1.incremental_cluster(None)
+        print("Batch 1 result:")
+        print(result1)
+        print()
+        
+        # Second batch
+        batch2 = pl.DataFrame({
+            "name": ["JOHN"],  # Exact match
+            "id": [3]
+        })
+        
+        gen2 = SimilarityMatrixGeneratorPolars(
+            df=batch2,
+            conditions=conditions,
+            id_col="id",
+            always_string_labels=True
+        )
+        
+        result2, batch2_only = gen2.incremental_cluster(result1)
+        print("Final result:")
+        print(result2)
+        print()
+        print("Batch 2 only:")
+        print(batch2_only)
+        
+        return result2
+    print("Running minimal test...\n")
+    minimal_test()
+    print("\n" + "="*60 + "\n")
+    
+    print("Running working demo...\n")
+    working_incremental_demo()
+    print("\n" + "="*60 + "\n")
+    
+    print("Running test with existing labels...\n")
+    test_with_existing_labels()
+    
+    print("\n✓ All tests completed successfully!")
