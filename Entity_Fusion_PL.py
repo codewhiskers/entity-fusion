@@ -16,6 +16,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from collections import Counter
 from itertools import combinations
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
@@ -699,33 +700,46 @@ class SimilarityMatrixGeneratorPolars:
                         q.append(v)
             comp_id += 1
 
+
     def _derive_final_labels_with_old(
         self, clusters: Dict[object, int], old_map: Dict[object, str]
     ) -> Dict[object, str]:
         """
-        If a component intersects exactly one non-sentinel old label => inherit that label.
-        If it intersects multiple labels => join them (sorted) with '_'.
-        Else => assign "new_{cid}".
+        Choose ONE canonical old label per connected component.
+        - If component intersects old labels: pick the most frequent.
+        Ties broken by shortest, then lexicographic.
+        - Else: assign "new_{cid}".
         """
         comp_to_nodes: Dict[int, List[object]] = defaultdict(list)
         for node, cid in clusters.items():
             comp_to_nodes[cid].append(node)
 
-        comp_label: Dict[int, str] = {}
+        node_to_label: Dict[object, str] = {}
         for cid, nodes in comp_to_nodes.items():
-            old_labels = {
+            labels = [
                 old_map[n]
                 for n in nodes
                 if n in old_map and old_map[n] not in self.unclustered_sentinels
-            }
-            if len(old_labels) == 1:
-                comp_label[cid] = next(iter(old_labels))
-            elif len(old_labels) > 1:
-                comp_label[cid] = "_".join(sorted(old_labels))
-            else:
-                comp_label[cid] = f"new_{cid}"
+            ]
 
-        return {node: comp_label[cid] for node, cid in clusters.items()}
+            if labels:
+                counts = Counter(labels)
+                # pick a single canonical label
+                #   1) highest count
+                #   2) shortest string
+                #   3) lexicographic
+                canonical = sorted(
+                    counts.items(),
+                    key=lambda kv: (-kv[1], len(kv[0]), kv[0])
+                )[0][0]
+                chosen = canonical
+            else:
+                chosen = f"new_{cid}"
+
+            for n in nodes:
+                node_to_label[n] = chosen
+
+        return node_to_label
 
     def _sentinel_mask_expr_safe(self, df: pl.DataFrame, col: str) -> pl.Expr:
         """
