@@ -44,7 +44,8 @@ def _ensure_id_col(df: pl.DataFrame, id_col: Optional[str]) -> Tuple[pl.DataFram
             raise ValueError(
                 "id_col not provided and '_id' already exists in DataFrame."
             )
-        df = df.with_row_count("_id")
+        # Force Int64 instead of default u32
+        df = df.with_row_count("_id", dtype=pl.Int64)
         return df, "_id"
     if id_col not in df.columns:
         raise ValueError(f"id_col '{id_col}' not found in DataFrame.")
@@ -369,8 +370,10 @@ class SimilarityMatrixGeneratorPolars:
         ).item()
         if null_total > 0:
             start = int(max([v for v in self.clusters.values()], default=-1)) + 1
-            # add a stable row counter to join fills back precisely where null
-            out = out.with_row_count("__rc__")
+
+            # Force Int64 here too
+            out = out.with_row_count("__rc__", dtype=pl.Int64)
+
             null_rc = (
                 out.filter(pl.col("cluster_label").is_null())
                 .select("__rc__")
@@ -378,7 +381,14 @@ class SimilarityMatrixGeneratorPolars:
                 .to_list()
             )
             fill_vals = [start + i for i in range(null_total)]
-            fill_df = pl.DataFrame({"__rc__": null_rc, "__fill__": fill_vals})
+
+            fill_df = pl.DataFrame(
+                {
+                    "__rc__": pl.Series("__rc__", null_rc, dtype=pl.Int64),
+                    "__fill__": pl.Series("__fill__", fill_vals, dtype=pl.Int64),
+                }
+            )
+
             out = (
                 out.join(fill_df, on="__rc__", how="left")
                 .with_columns(
