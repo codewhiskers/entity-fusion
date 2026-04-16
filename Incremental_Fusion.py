@@ -6,6 +6,7 @@ from typing import Dict, Any, List, Optional, Tuple, Union, Set
 from pathlib import Path
 import math
 import json
+import warnings
 from datetime import datetime
 
 import polars as pl
@@ -65,6 +66,7 @@ class IncrementalSignalLinker:
     _cluster_id_counter: int = field(default=0, init=False)
     _last_final_pairs: Optional[pl.DataFrame] = field(default=None, init=False)
     _last_records: Optional[pl.DataFrame] = field(default=None, init=False)
+    _block_warnings: List[Dict[str, Any]] = field(default_factory=list, init=False)
 
     _alias_store: pl.DataFrame = field(
         default_factory=lambda: pl.DataFrame(
@@ -89,6 +91,23 @@ class IncrementalSignalLinker:
 
         Path(self.network_output_dir).mkdir(parents=True, exist_ok=True)
 
+    def _record_block_warning(
+        self, *, alias_type: str, block_key: Any, size: int, df_cap: int
+    ) -> None:
+        warning = {
+            "alias_type": alias_type,
+            "block_key": str(block_key),
+            "size": int(size),
+            "df_cap": int(df_cap),
+            "action": self.block_cap_action,
+        }
+        self._block_warnings.append(warning)
+        warnings.warn(
+            f"Skipping oversized block for {alias_type}: "
+            f"block_key={warning['block_key']!r}, size={size}, df_cap={df_cap}",
+            stacklevel=2,
+        )
+
     # ------------------------ Enhanced Public API ------------------------
 
     def link_incremental(
@@ -97,6 +116,7 @@ class IncrementalSignalLinker:
         if batch_id is None:
             batch_id = datetime.now().isoformat()
 
+        self._block_warnings = []
         df = self._to_polars(records)
         self._specs = self._compile_alias_specs(self.blocking_plan)
         include = self.include_types or list(self._specs.keys())
@@ -179,6 +199,7 @@ class IncrementalSignalLinker:
         out["clusters"] = self.get_clusters()
         out["cluster_stats"] = self.get_cluster_stats()
         out["labeled_records"] = self._label_records(df)
+        out["block_warnings"] = self._block_warnings.copy()
 
         self._last_final_pairs = out["final_pairs"]
         self._last_records = out["labeled_records"]
@@ -198,6 +219,7 @@ class IncrementalSignalLinker:
         Original link method with minor modifications for tracking.
         """
         df = self._to_polars(records)
+        self._block_warnings = []
         self._specs = self._compile_alias_specs(self.blocking_plan)
 
         include = self.include_types or list(self._specs.keys())
@@ -234,6 +256,7 @@ class IncrementalSignalLinker:
             "pairs_scored": pairs_scored,
             "final_pairs": final_pairs,
             "labeled_records": self._label_records(df),
+            "block_warnings": self._block_warnings.copy(),
         }
 
         self._last_final_pairs = out["final_pairs"]
@@ -1345,6 +1368,15 @@ class IncrementalSignalLinker:
             block_sizes = (
                 av.select("block_key").group_by("block_key").len().rename({"len": "n"})
             )
+            if df_cap is not None:
+                oversized = block_sizes.filter(pl.col("n") > df_cap)
+                for row in oversized.iter_rows(named=True):
+                    self._record_block_warning(
+                        alias_type=alias_type,
+                        block_key=row["block_key"],
+                        size=row["n"],
+                        df_cap=df_cap,
+                    )
             av2 = av.join(block_sizes, on="block_key", how="left")
             if df_cap is not None:
                 av2 = av2.filter(pl.col("n") <= df_cap)
@@ -1408,6 +1440,12 @@ class IncrementalSignalLinker:
             n = g.height
             if df_cap is not None and n > df_cap:
                 if self.block_cap_action == "skip":
+                    self._record_block_warning(
+                        alias_type=alias_type,
+                        block_key=blk[0] if isinstance(blk, tuple) else blk,
+                        size=n,
+                        df_cap=df_cap,
+                    )
                     continue
             blocks.append((blk, g))
 
