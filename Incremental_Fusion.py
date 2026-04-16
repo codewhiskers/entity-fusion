@@ -1240,6 +1240,24 @@ class IncrementalSignalLinker:
                     block_value=block_expr.alias("block_value"),
                     sim_value=pl.col(sim_field).cast(pl.Utf8).fill_null(""),
                 )
+                # Drop rows whose comparison value, alias value, or block value
+                # is effectively empty so null-heavy records cannot collapse into
+                # giant shared keys such as "" or "|".
+                .filter(pl.col("sim_value").str.strip_chars().str.len_chars() > 0)
+                .filter(
+                    pl.col("alias_value")
+                    .str.strip_chars()
+                    .str.strip_chars("|")
+                    .str.len_chars()
+                    > 0
+                )
+                .filter(
+                    pl.col("block_value")
+                    .str.strip_chars()
+                    .str.strip_chars("|")
+                    .str.len_chars()
+                    > 0
+                )
                 .with_columns(
                     alias_key=pl.concat_str(
                         [pl.lit(atype), pl.lit(":"), pl.col("alias_value")]
@@ -1331,7 +1349,16 @@ class IncrementalSignalLinker:
             if df_cap is not None:
                 av2 = av2.filter(pl.col("n") <= df_cap)
 
-            for _, g in av2.group_by("alias_key", maintain_order=False):
+            exact_groups = list(av2.group_by("alias_key", maintain_order=False))
+            exact_iter = exact_groups
+            if self.show_progress:
+                exact_iter = tqdm(
+                    exact_groups,
+                    desc=f"{alias_type} exact groups",
+                    unit="group",
+                )
+
+            for _, g in exact_iter:
                 owners = g.get_column("owner_id").to_list()
                 if len(owners) < 2:
                     continue
