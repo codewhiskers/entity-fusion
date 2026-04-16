@@ -1,0 +1,205 @@
+{
+  "matches": [
+    {
+      "a": "R1",
+      "b": "R3",
+      "score": 1.5,
+      "signals": [
+        "PHONE"
+      ],
+      "batch_id": "batch1",
+      "timestamp": "2025-11-11T22:38:53.813576"
+    },
+    {
+      "a": "R1",
+      "b": "R2",
+      "score": 2.7232979688291916,
+      "signals": [
+        "NAME_KEY_COSINE",
+        "PHONE"
+      ],
+      "batch_id": "batch1",
+      "timestamp": "2025-11-11T22:38:53.813584"
+    },
+    {
+      "a": "R2",
+      "b": "R3",
+      "score": 1.5,
+      "signals": [
+        "PHONE"
+      ],
+      "batch_id": "batch1",
+      "timestamp": "2025-11-11T22:38:53.813588"
+    },
+    {
+      "a": "R1",
+      "b": "R6",
+      "score": 1.836472236621213,
+      "signals": [
+        "PHONE"
+      ],
+      "batch_id": "batch2",
+      "timestamp": "2025-11-11T22:38:53.840047"
+    },
+    {
+      "a": "R2",
+      "b": "R6",
+      "score": 1.836472236621213,
+      "signals": [
+        "PHONE"
+      ],
+      "batch_id": "batch2",
+      "timestamp": "2025-11-11T22:38:53.840051"
+    },
+    {
+      "a": "R4",
+      "b": "R5",
+      "score": 2.3472978603872034,
+      "signals": [
+        "NAME_KEY_COSINE",
+        "PHONE"
+      ],
+      "batch_id": "batch2",
+      "timestamp": "2025-11-11T22:38:53.840058"
+    },
+    {
+      "a": "R3",
+      "b": "R6",
+      "score": 1.836472236621213,
+      "signals": [
+        "NAME_KEY_COSINE",
+        "PHONE"
+      ],
+      "batch_id": "batch2",
+      "timestamp": "2025-11-11T22:38:53.840062"
+    },
+    {
+      "a": "R2",
+      "b": "R3",
+      "score": 1.5,
+      "signals": [
+        "PHONE"
+      ],
+      "batch_id": "batch1",
+      "timestamp": "2025-11-11T22:39:25.069425"
+    },
+    {
+      "a": "R2",
+      "b": "R6",
+      "score": 0.5,
+      "signals": [
+        "PHONE"
+      ],
+      "batch_id": "batch1",
+      "timestamp": "2025-11-11T22:39:25.069430"
+    },
+    {
+      "a": "R1",
+      "b": "R2",
+      "score": 2.7232979688291916,
+      "signals": [
+        "NAME_KEY_COSINE",
+        "PHONE"
+      ],
+      "batch_id": "batch1",
+      "timestamp": "2025-11-11T22:39:25.069434"
+    },
+    {
+      "a": "R1",
+      "b": "R6",
+      "score": 0.5,
+      "signals": [
+        "PHONE"
+      ],
+      "batch_id": "batch1",
+      "timestamp": "2025-11-11T22:39:25.069438"
+    },
+    {
+      "a": "R4",
+      "b": "R5",
+      "score": 0.5,
+      "signals": [
+        "NAME_KEY_COSINE",
+        "PHONE"
+      ],
+      "batch_id": "batch1",
+      "timestamp": "2025-11-11T22:39:25.069442"
+    },
+    {
+      "a": "R3",
+      "b": "R6",
+      "score": 0.5,
+      "signals": [
+        "NAME_KEY_COSINE",
+        "PHONE"
+      ],
+      "batch_id": "batch1",
+      "timestamp": "2025-11-11T22:39:25.069445"
+    },
+    {
+      "a": "R1",
+      "b": "R3",
+      "score": 1.5,
+      "signals": [
+        "PHONE"
+      ],
+      "batch_id": "batch1",
+      "timestamp": "2025-11-11T22:39:25.069450"
+    },
+    {
+      "a": "R3",
+      "b": "R6",
+      "score": 1.836472236621213,
+      "signals": [
+        "NAME_KEY_COSINE",
+        "PHONE"
+      ],
+      "batch_id": "batch2",
+      "timestamp": "2025-11-11T22:39:25.093049"
+    },
+    {
+      "a": "R4",
+      "b": "R5",
+      "score": 2.3472978603872034,
+      "signals": [
+        "NAME_KEY_COSINE",
+        "PHONE"
+      ],
+      "batch_id": "batch2",
+      "timestamp": "2025-11-11T22:39:25.093054"
+    },
+    {
+      "a": "R2",
+      "b": "R6",
+      "score": 1.836472236621213,
+      "signals": [
+        "PHONE"
+      ],
+      "batch_id": "batch2",
+      "timestamp": "2025-11-11T22:39:25.093058"
+    },
+    {
+      "a": "R1",
+      "b": "R6",
+      "score": 1.836472236621213,
+      "signals": [
+        "PHONE"
+      ],
+      "batch_id": "batch2",
+      "timestamp": "2025-11-11T22:39:25.093062"
+    }
+  ],
+  "clusters": {
+    "C0": [
+      "R1",
+      "R2",
+      "R3",
+      "R6"
+    ],
+    "C1": [
+      "R5",
+      "R4"
+    ]
+  },
+  "cluster_id_counter": 2
+}

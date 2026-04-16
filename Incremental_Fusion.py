@@ -12,6 +12,7 @@ import polars as pl
 import numpy as np
 import networkx as nx
 from pyvis.network import Network  # For interactive visualization
+from tqdm.auto import tqdm
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -54,6 +55,7 @@ class IncrementalSignalLinker:
 
     # Diagnostics
     return_intermediates: bool = False
+    show_progress: bool = False
 
     # Internal state
     _specs: Dict[str, Dict[str, Any]] = field(default_factory=dict, init=False)
@@ -61,6 +63,8 @@ class IncrementalSignalLinker:
     _cluster_graph: nx.Graph = field(default_factory=nx.Graph, init=False)
     _clusters: Dict[str, Set[str]] = field(default_factory=dict, init=False)
     _cluster_id_counter: int = field(default=0, init=False)
+    _last_final_pairs: Optional[pl.DataFrame] = field(default=None, init=False)
+    _last_records: Optional[pl.DataFrame] = field(default=None, init=False)
 
     _alias_store: pl.DataFrame = field(
         default_factory=lambda: pl.DataFrame(
@@ -142,8 +146,12 @@ class IncrementalSignalLinker:
                 if p_cross.height:
                     pairs_parts.append(p_cross)
 
-        # K-of-N → score → select
-        pairs_long = self._candidates_k_of_n(pairs_parts, self.k_required)
+        # Candidate filtering: AND/OR tree takes precedence over K-of-N
+        if self._is_condition_tree(self.blocking_plan):
+            pairs_long = self._candidates_k_of_n(pairs_parts, 1)
+            pairs_long = self._apply_condition_filter(pairs_long, self.blocking_plan)
+        else:
+            pairs_long = self._candidates_k_of_n(pairs_parts, self.k_required)
         pairs_scored = self._score_pairs(pairs_long, alias_index)
         final_pairs = self._select_pairs(
             pairs_scored, threshold=self.select_threshold, quantile=self.select_quantile
@@ -170,6 +178,10 @@ class IncrementalSignalLinker:
             out["network"] = self._build_network_graph(out)
         out["clusters"] = self.get_clusters()
         out["cluster_stats"] = self.get_cluster_stats()
+        out["labeled_records"] = self._label_records(df)
+
+        self._last_final_pairs = out["final_pairs"]
+        self._last_records = out["labeled_records"]
 
         if self.matches_file:
             self.save_matches(self.matches_file)
@@ -207,7 +219,11 @@ class IncrementalSignalLinker:
             if p.height:
                 pairs_parts.append(p)
 
-        pairs_long = self._candidates_k_of_n(pairs_parts, self.k_required)
+        if self._is_condition_tree(self.blocking_plan):
+            pairs_long = self._candidates_k_of_n(pairs_parts, 1)
+            pairs_long = self._apply_condition_filter(pairs_long, self.blocking_plan)
+        else:
+            pairs_long = self._candidates_k_of_n(pairs_parts, self.k_required)
         pairs_scored = self._score_pairs(pairs_long, alias_index)
         final_pairs = self._select_pairs(
             pairs_scored, threshold=self.select_threshold, quantile=self.select_quantile
@@ -217,7 +233,12 @@ class IncrementalSignalLinker:
             "pairs_long": pairs_long,
             "pairs_scored": pairs_scored,
             "final_pairs": final_pairs,
+            "labeled_records": self._label_records(df),
         }
+
+        self._last_final_pairs = out["final_pairs"]
+        self._last_records = out["labeled_records"]
+
         if self.return_intermediates:
             out.update({"alias_value": alias_value, "alias_index": alias_index})
         return out
@@ -637,6 +658,326 @@ class IncrementalSignalLinker:
 
         return output_path
 
+    def visualize_records_with_fields(
+        self,
+        records: RecordFrame,
+        final_pairs: pl.DataFrame,
+        fields: List[str],
+        cluster_label: Optional[str] = None,
+        output_path: Optional[str] = None,
+        label_field: Optional[str] = None,
+        max_label_length: int = 32,
+    ) -> str:
+        """
+        Create an interactive network using record fields for node labels/tooltips.
+
+        Parameters
+        ----------
+        records:
+            DataFrame containing at least the record id column and the requested fields.
+            If a `cluster_label` column is present, it can be used to filter to one cluster.
+        final_pairs:
+            The accepted pair output from `link()` or `link_incremental()`.
+        fields:
+            Record fields to display in the node tooltip.
+        cluster_label:
+            Optional cluster id / cluster_label value to visualize only one cluster.
+        output_path:
+            Optional path for the generated HTML file.
+        label_field:
+            Optional field to use as the visible node label. Defaults to `record_id_col`.
+        """
+        df = self._to_polars(records)
+        if final_pairs.height == 0:
+            raise ValueError("final_pairs is empty; nothing to visualize")
+
+        if cluster_label is not None:
+            if "cluster_label" not in df.columns:
+                raise ValueError(
+                    "records must include a 'cluster_label' column to filter by cluster"
+                )
+            df = df.filter(pl.col("cluster_label") == cluster_label)
+            if df.height == 0:
+                raise ValueError(f"No records found for cluster_label={cluster_label!r}")
+
+        node_ids = set(df.get_column(self.record_id_col).cast(pl.Utf8).to_list())
+        pairs = final_pairs.with_columns(
+            a=pl.col("a").cast(pl.Utf8),
+            b=pl.col("b").cast(pl.Utf8),
+        )
+        pairs = pairs.filter(
+            pl.col("a").is_in(node_ids) & pl.col("b").is_in(node_ids)
+        )
+        if pairs.height == 0:
+            raise ValueError("No accepted edges exist for the requested records/cluster")
+
+        display_fields = [f for f in fields if f in df.columns]
+        if not display_fields:
+            raise ValueError("None of the requested fields were found in records")
+
+        label_col = (
+            label_field
+            if label_field and label_field in df.columns
+            else self.record_id_col
+        )
+
+        node_records = {}
+        for row in df.iter_rows(named=True):
+            record_id = str(row[self.record_id_col])
+            node_records[record_id] = row
+
+        net = Network(
+            height="850px",
+            width="100%",
+            bgcolor="#222222",
+            font_color="white",
+            notebook=False,
+        )
+
+        for record_id, row in node_records.items():
+            label_value = str(row.get(label_col, record_id))
+            if len(label_value) > max_label_length:
+                label_value = label_value[: max_label_length - 3] + "..."
+
+            tooltip_lines = [f"<b>{self.record_id_col}</b>: {record_id}"]
+            if "cluster_label" in row:
+                tooltip_lines.append(f"<b>cluster_label</b>: {row['cluster_label']}")
+            for field in display_fields:
+                tooltip_lines.append(f"<b>{field}</b>: {row.get(field, '')}")
+
+            node_color = "#97c2fc"
+            cluster_value = row.get("cluster_label")
+            if cluster_value and str(cluster_value).startswith("C"):
+                node_color = f"#{hash(str(cluster_value)) % 0xFFFFFF:06x}"
+
+            net.add_node(
+                record_id,
+                label=label_value,
+                color=node_color,
+                title="<br>".join(tooltip_lines),
+            )
+
+        for edge in pairs.iter_rows(named=True):
+            signals = edge.get("signals", [])
+            if isinstance(signals, list):
+                signal_text = ", ".join(signals)
+            else:
+                signal_text = str(signals)
+            score = float(edge.get("score", 1.0))
+            title = f"score: {score:.3f}<br>signals: {signal_text}"
+            net.add_edge(edge["a"], edge["b"], value=score, title=title)
+
+        net.barnes_hut(gravity=-80000, central_gravity=0.25, spring_length=220)
+
+        if output_path is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            suffix = cluster_label if cluster_label is not None else "all"
+            output_path = (
+                f"{self.network_output_dir}/field_network_{suffix}_{timestamp}.html"
+            )
+
+        net.save_graph(output_path)
+        return output_path
+
+    def generate_dashboard(
+        self,
+        fields: List[str],
+        output_path: str,
+        *,
+        records: Optional[RecordFrame] = None,
+        final_pairs: Optional[pl.DataFrame] = None,
+        top_n_clusters: int = 50,
+        min_cluster_size: int = 2,
+        label_field: Optional[str] = None,
+    ) -> str:
+        """
+        Generate a self-contained interactive HTML dashboard.
+
+        The dashboard shows a vis.js network of matched records on the left and a
+        reactive record table on the right.  Clicking a node (or a cluster in the
+        sidebar list) highlights that cluster in the graph and populates the table;
+        clicking a table row focuses and selects the corresponding node.
+
+        Parameters
+        ----------
+        fields:
+            Record fields to show in node tooltips and the record table.
+        output_path:
+            Destination path for the HTML file.
+        records:
+            DataFrame with at least `record_id_col` and the requested `fields`.
+            Defaults to the labeled records from the most recent link() call.
+        final_pairs:
+            Accepted pairs from link() or link_incremental().
+            Defaults to the final pairs from the most recent link() call.
+        top_n_clusters:
+            Only render the N largest clusters.
+        min_cluster_size:
+            Exclude clusters smaller than this.
+        label_field:
+            Field to use as the visible node label.  Defaults to record_id_col.
+
+        Returns
+        -------
+        The output_path that was written.
+        """
+        import colorsys
+        import json as _json
+
+        if records is None:
+            if self._last_records is None:
+                raise ValueError(
+                    "No records available. Either call link() / link_incremental() first, "
+                    "or pass records= explicitly."
+                )
+            records = self._last_records
+        if final_pairs is None:
+            if self._last_final_pairs is None:
+                raise ValueError(
+                    "No final_pairs available. Either call link() / link_incremental() first, "
+                    "or pass final_pairs= explicitly."
+                )
+            final_pairs = self._last_final_pairs
+
+        df = self._to_polars(records)
+
+        # ── 1. Choose clusters to show ────────────────────────────────────────
+        cluster_sizes = sorted(
+            [
+                (cid, len(members))
+                for cid, members in self._clusters.items()
+                if len(members) >= min_cluster_size
+            ],
+            key=lambda x: -x[1],
+        )[:top_n_clusters]
+
+        if not cluster_sizes:
+            raise ValueError(
+                "No clusters meet the criteria (min_cluster_size=%d). "
+                "Run link() or link_incremental() first." % min_cluster_size
+            )
+
+        shown_cluster_ids = {cid for cid, _ in cluster_sizes}
+
+        # ── 2. record_id → cluster_id ─────────────────────────────────────────
+        id_to_cluster: Dict[str, str] = {}
+        for cid, members in self._clusters.items():
+            if cid in shown_cluster_ids:
+                for member in members:
+                    id_to_cluster[str(member)] = cid
+        shown_record_ids = set(id_to_cluster.keys())
+
+        # ── 3. Filter records; resolve available fields ───────────────────────
+        available_fields = [f for f in fields if f in df.columns]
+        label_col = (
+            label_field
+            if label_field and label_field in df.columns
+            else self.record_id_col
+        )
+        shown_df = df.filter(
+            pl.col(self.record_id_col).cast(pl.Utf8).is_in(list(shown_record_ids))
+        )
+
+        # ── 4. Colour palette: golden-ratio HSV → perceptually distinct hues ──
+        def _cluster_color(i: int) -> tuple:
+            hue = (i * 0.618033988749895) % 1.0
+            r, g, b = colorsys.hsv_to_rgb(hue, 0.55, 0.90)
+            bg = f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
+            r2, g2, b2 = colorsys.hsv_to_rgb(hue, 0.75, 0.68)
+            border = f"#{int(r2*255):02x}{int(g2*255):02x}{int(b2*255):02x}"
+            return bg, border
+
+        color_map = {
+            cid: _cluster_color(i) for i, (cid, _) in enumerate(cluster_sizes)
+        }
+
+        # ── 5. Build vis.js nodes + table data ───────────────────────────────
+        vis_nodes: List[Dict] = []
+        table_data: Dict[str, List[Dict]] = {}
+
+        for row in shown_df.iter_rows(named=True):
+            rid = str(row[self.record_id_col])
+            cid = id_to_cluster.get(rid)
+            if cid is None:
+                continue
+
+            bg, border = color_map.get(cid, ("#97c2fc", "#4a7fc2"))
+            raw_label = str(row.get(label_col, rid))
+            label = raw_label[:32] + ("…" if len(raw_label) > 32 else "")
+
+            tooltip_parts = [f"<b>id:</b> {rid}", f"<b>cluster:</b> {cid}"]
+            for f in available_fields:
+                v = row.get(f)
+                if v is not None:
+                    tooltip_parts.append(f"<b>{f}:</b> {v}")
+
+            vis_nodes.append({
+                "id": rid,
+                "label": label,
+                "title": "<br>".join(tooltip_parts),
+                "cluster_id": cid,
+                "color": {
+                    "background": bg,
+                    "border": border,
+                    "highlight": {"background": "#fde68a", "border": "#d97706"},
+                    "hover": {"background": "#fef3c7", "border": "#d97706"},
+                },
+            })
+
+            row_dict = {self.record_id_col: rid}
+            for f in available_fields:
+                v = row.get(f)
+                row_dict[f] = "" if v is None else str(v)
+            table_data.setdefault(cid, []).append(row_dict)
+
+        # ── 6. Build vis.js edges (within shown clusters only) ────────────────
+        vis_edges: List[Dict] = []
+        if final_pairs.height > 0:
+            for row in final_pairs.iter_rows(named=True):
+                a, b = str(row["a"]), str(row["b"])
+                if a not in shown_record_ids or b not in shown_record_ids:
+                    continue
+                score = round(float(row.get("score", 1.0)), 3)
+                signals = row.get("signals") or []
+                if isinstance(signals, str):
+                    signals = [signals]
+                tooltip = f"score: {score:.3f}<br>signals: {', '.join(signals)}"
+                edge_color = color_map.get(id_to_cluster.get(a, ""), ("#97c2fc", "#4a7fc2"))[1]
+                vis_edges.append({
+                    "from": a,
+                    "to": b,
+                    "title": tooltip,
+                    "value": score,
+                    "color": {"color": edge_color, "highlight": "#f59e0b", "hover": "#f59e0b"},
+                })
+
+        # ── 7. Summary stats + cluster list for sidebar ───────────────────────
+        stats = {
+            "clusters_shown": len(cluster_sizes),
+            "clusters_total": len(self._clusters),
+            "records_shown": len(vis_nodes),
+            "edges_shown": len(vis_edges),
+            "largest": cluster_sizes[0][1] if cluster_sizes else 0,
+        }
+        cluster_list = [
+            {"id": cid, "size": sz, "color": color_map[cid][0]}
+            for cid, sz in cluster_sizes
+        ]
+
+        # ── 8. Inject data into template and write ────────────────────────────
+        html = _DASHBOARD_HTML
+        html = html.replace("__NODES__",        _json.dumps(vis_nodes))
+        html = html.replace("__EDGES__",        _json.dumps(vis_edges))
+        html = html.replace("__TABLE_DATA__",   _json.dumps(table_data))
+        html = html.replace("__FIELDS__",       _json.dumps([self.record_id_col] + available_fields))
+        html = html.replace("__STATS__",        _json.dumps(stats))
+        html = html.replace("__CLUSTER_LIST__", _json.dumps(cluster_list))
+
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as fh:
+            fh.write(html)
+        return output_path
+
     # ------------------------ Persistence ------------------------
 
     def save_matches(self, filepath: str):
@@ -706,6 +1047,27 @@ class IncrementalSignalLinker:
         return pl.DataFrame()
 
     # ------------------------ Analysis Methods ------------------------
+
+    def _label_records(self, records: pl.DataFrame) -> pl.DataFrame:
+        """
+        Return records with a 'cluster_label' column attached.
+
+        Records that belong to a cluster get that cluster's ID.
+        Unmatched (singleton) records get a label of the form
+        'singleton_<record_id>' so every row always has a label.
+        """
+        id_to_cluster: Dict[str, str] = {}
+        for cluster_id, members in self._clusters.items():
+            for member in members:
+                id_to_cluster[str(member)] = cluster_id
+
+        labels = [
+            id_to_cluster.get(str(rid), f"singleton_{rid}")
+            for rid in records[self.record_id_col].to_list()
+        ]
+        return records.with_columns(
+            pl.Series("cluster_label", labels, dtype=pl.Utf8)
+        )
 
     def get_clusters(self) -> Dict[str, List[str]]:
         """Get current clusters."""
@@ -778,12 +1140,33 @@ class IncrementalSignalLinker:
 
     # ------------------------ Original Methods (kept from base class) ------------------------
 
+    @staticmethod
+    def _is_condition_tree(plan: Dict) -> bool:
+        """Return True if the blocking plan uses AND/OR condition tree syntax."""
+        return "and" in plan or "or" in plan
+
+    def _extract_leaf_specs(self, condition: Dict) -> Dict[str, Dict]:
+        """Recursively extract flat signal specs from an AND/OR condition tree."""
+        if "and" in condition:
+            specs: Dict[str, Dict] = {}
+            for sub in condition["and"]:
+                specs.update(self._extract_leaf_specs(sub))
+            return specs
+        if "or" in condition:
+            specs = {}
+            for sub in condition["or"]:
+                specs.update(self._extract_leaf_specs(sub))
+            return specs
+        # Leaf node — keys are signal type names
+        return dict(condition)
+
     def _compile_alias_specs(
         self, plan: Dict[str, Dict[str, Any]]
     ) -> Dict[str, Dict[str, Any]]:
-        """Compile alias specifications from blocking plan."""
+        """Compile alias specifications from blocking plan (flat or AND/OR tree)."""
+        leaf_plan = self._extract_leaf_specs(plan) if self._is_condition_tree(plan) else plan
         specs: Dict[str, Dict[str, Any]] = {}
-        for alias_type, cfg in plan.items():
+        for alias_type, cfg in leaf_plan.items():
             fields = cfg["fields"]
             compose = cfg.get("compose")
             block_on = cfg.get("block_on")
@@ -1002,14 +1385,30 @@ class IncrementalSignalLinker:
             blocks.append((blk, g))
 
         out_parts: List[pl.DataFrame] = []
-        for blk, g in blocks:
+        block_iter = blocks
+        if self.show_progress:
+            block_iter = tqdm(
+                blocks,
+                desc=f"{alias_type} blocks",
+                unit="block",
+            )
+        for blk, g in block_iter:
             texts = g.get_column("sim_value").to_list()
             if len(texts) < 2:
+                continue
+            # Skip blocks that have no usable text for the configured analyzer.
+            cleaned_texts = [str(text).strip() for text in texts]
+            if sum(bool(text) for text in cleaned_texts) < 2:
                 continue
             vect = TfidfVectorizer(
                 analyzer=analyzer, ngram_range=ngram_range, min_df=min_df
             )
-            X = vect.fit_transform(texts)
+            try:
+                X = vect.fit_transform(cleaned_texts)
+            except ValueError:
+                # scikit-learn raises "empty vocabulary" when all values in a
+                # block are blank or too short to produce any n-grams.
+                continue
             S = cosine_similarity(X, dense_output=False)
             S = S.tocoo()
             if S.nnz == 0:
@@ -1080,6 +1479,56 @@ class IncrementalSignalLinker:
             .select("a", "b")
         )
         return temp.join(keep, on=["a", "b"], how="inner")
+
+    def _apply_condition_filter(
+        self, pairs_long: pl.DataFrame, condition: Dict
+    ) -> pl.DataFrame:
+        """
+        Filter pairs_long according to an AND/OR condition tree.
+
+        - AND: a pair must satisfy every sub-condition
+        - OR:  a pair must satisfy at least one sub-condition
+        - Leaf: a pair satisfies the condition if it has a match on any
+                signal type named in that leaf dict
+
+        Returns the filtered pairs_long (same schema, subset of rows).
+        """
+        if pairs_long.height == 0:
+            return pairs_long
+
+        passing = self._condition_tree_pairs(pairs_long, condition)
+
+        if not passing:
+            return pairs_long.clear()
+
+        a_list, b_list = zip(*passing)
+        keep = pl.DataFrame({"a": list(a_list), "b": list(b_list)})
+        return pairs_long.join(keep, on=["a", "b"], how="inner")
+
+    def _condition_tree_pairs(
+        self, pairs_long: pl.DataFrame, condition: Dict
+    ) -> Set[Tuple[str, str]]:
+        """Recursively evaluate an AND/OR condition tree against pairs_long."""
+        if "and" in condition:
+            sets = [
+                self._condition_tree_pairs(pairs_long, sub)
+                for sub in condition["and"]
+            ]
+            return set.intersection(*sets) if sets else set()
+        if "or" in condition:
+            sets = [
+                self._condition_tree_pairs(pairs_long, sub)
+                for sub in condition["or"]
+            ]
+            return set.union(*sets) if sets else set()
+        # Leaf: match if any signal in this leaf contributed a pair.
+        # Persisted matches retain the original signal but use
+        # alias_type="PREDEFINED" when rehydrated.
+        signal_types = list(condition.keys())
+        matching = pairs_long.filter(pl.col("signal").is_in(signal_types))
+        if matching.height == 0:
+            return set()
+        return set(zip(matching["a"].to_list(), matching["b"].to_list()))
 
     def _score_pairs(
         self, pairs_long: pl.DataFrame, alias_index: pl.DataFrame
@@ -1160,6 +1609,364 @@ class IncrementalSignalLinker:
         if isinstance(df, pl.DataFrame):
             return df
         raise TypeError("records must be a polars.DataFrame or pandas.DataFrame")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dashboard HTML template
+# Data placeholders (__NODES__, __EDGES__, etc.) are replaced at render time.
+# ─────────────────────────────────────────────────────────────────────────────
+_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Entity Cluster Dashboard</title>
+  <script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+           background: #0f1117; color: #e2e8f0; height: 100vh;
+           display: flex; flex-direction: column; overflow: hidden; }
+
+    /* ── Header ── */
+    #hdr { background: #1a1f2e; border-bottom: 1px solid #2d3748;
+           padding: 0 20px; height: 48px; flex-shrink: 0;
+           display: flex; align-items: center; justify-content: space-between; }
+    #hdr h1 { font-size: 14px; font-weight: 600; color: #e2e8f0; letter-spacing: .3px; }
+    .stats  { display: flex; gap: 22px; }
+    .stat   { font-size: 12px; color: #718096; }
+    .stat strong { color: #7dd3fc; }
+
+    /* ── Body ── */
+    #body { flex: 1; display: flex; overflow: hidden; }
+
+    /* ── Graph panel ── */
+    #gp { flex: 0 0 52%; position: relative; background: #0f1117; min-width: 20%; }
+    #net { width: 100%; height: 100%; }
+
+    /* ── Resize handle ── */
+    #rzr { width: 5px; cursor: col-resize; background: #2d3748; flex-shrink: 0;
+           transition: background .15s; }
+    #rzr:hover, #rzr.drag { background: #4a90d9; }
+
+    /* ── Sidebar ── */
+    #sb { flex: 0 0 48%; display: flex; flex-direction: column;
+          background: #1a1f2e; border-left: none; overflow: hidden; min-width: 20%; }
+
+    /* info card */
+    #ic { padding: 10px 16px; border-bottom: 1px solid #2d3748; flex-shrink: 0; }
+    .lbl   { font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+             color: #4a5568; margin-bottom: 5px; }
+    #ct    { font-size: 16px; font-weight: 700; color: #4a5568; }
+    #cs    { font-size: 12px; color: #4a5568; margin-top: 2px; }
+    .dot   { display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+             margin-right: 6px; vertical-align: middle; flex-shrink: 0; }
+
+    /* cluster list */
+    #cl { border-bottom: 1px solid #2d3748; overflow-y: auto; max-height: 220px; flex-shrink: 0; }
+    .ci { display: flex; align-items: center; gap: 8px; padding: 7px 16px;
+          cursor: pointer; font-size: 12px; color: #a0aec0;
+          border-bottom: 1px solid #ffffff08; }
+    .ci:hover  { background: #252d40; }
+    .ci.active { background: #1e3358; color: #7dd3fc; }
+    .ci-id   { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ci-sz   { font-size: 11px; color: #4a5568; flex-shrink: 0; }
+    .ci.active .ci-sz { color: #4a90d9; }
+
+    /* table */
+    #ta { flex: 1; overflow-y: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    thead { background: #131720; position: sticky; top: 0; z-index: 2; }
+    th { padding: 8px 12px; text-align: left; font-weight: 600; color: #4a5568;
+         font-size: 10px; text-transform: uppercase; letter-spacing: .6px;
+         border-bottom: 1px solid #2d3748; white-space: nowrap; }
+    td { padding: 7px 12px; border-bottom: 1px solid #1a2035; color: #cbd5e1;
+         max-width: 200px; overflow: hidden; text-overflow: ellipsis;
+         white-space: nowrap; cursor: pointer; }
+    tbody tr:hover td { background: #202940; }
+    tbody tr.sel td   { background: #1b3460; color: #93c5fd; }
+
+    .hint { display: flex; flex-direction: column; align-items: center;
+            justify-content: center; height: 100%; padding: 32px;
+            text-align: center; color: #2d3748; pointer-events: none; }
+    .hint p { font-size: 13px; line-height: 1.7; }
+    .hint p strong { display: block; font-size: 14px; margin-bottom: 6px; color: #3d4f6b; }
+  </style>
+</head>
+<body>
+  <div id="hdr">
+    <h1>&#11041; Entity Cluster Dashboard</h1>
+    <div class="stats" id="statsbar"></div>
+  </div>
+  <div id="body">
+    <div id="gp"><div id="net"></div></div>
+    <div id="rzr"></div>
+    <div id="sb">
+      <div id="ic">
+        <div class="lbl">Selected Cluster</div>
+        <div id="ct">None</div>
+        <div id="cs">Click a node or choose a cluster below</div>
+      </div>
+      <div id="cl"></div>
+      <div id="ta">
+        <div class="hint">
+          <p><strong>No cluster selected</strong>
+          Click any node in the graph, or pick a cluster from the list above.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ── injected data ──────────────────────────────────────────────────────────
+    const ND = __NODES__;
+    const ED = __EDGES__;
+    const TD = __TABLE_DATA__;
+    const FL = __FIELDS__;
+    const ST = __STATS__;
+    const CL = __CLUSTER_LIST__;
+
+    // ── stats bar ──────────────────────────────────────────────────────────────
+    const extra = ST.clusters_total > ST.clusters_shown
+      ? ` <span style="color:#4a5568">of ${ST.clusters_total}</span>` : "";
+    document.getElementById("statsbar").innerHTML = [
+      ["Clusters", ST.clusters_shown + extra],
+      ["Records",  ST.records_shown],
+      ["Edges",    ST.edges_shown],
+      ["Largest",  ST.largest + " records"],
+    ].map(([k,v]) => `<div class="stat">${k}: <strong>${v}</strong></div>`).join("");
+
+    // ── vis.js ─────────────────────────────────────────────────────────────────
+    const nodeIdx = Object.fromEntries(ND.map(n => [n.id, n]));
+
+    // Pre-index nodes and edges by cluster so we can swap them in instantly
+    const nodesByCluster = {};
+    ND.forEach(n => {
+      (nodesByCluster[n.cluster_id] = nodesByCluster[n.cluster_id] || []).push(n);
+    });
+    const edgesByCluster = {};
+    ED.forEach(e => {
+      const cid = nodeIdx[e.from]?.cluster_id;
+      if (!cid) return;
+      (edgesByCluster[cid] = edgesByCluster[cid] || []).push(e);
+    });
+
+    // Start with an empty graph — clusters are loaded on demand
+    const nodeset = new vis.DataSet([]);
+    const edgeset = new vis.DataSet([]);
+    const network = new vis.Network(document.getElementById("net"),
+      { nodes: nodeset, edges: edgeset },
+      {
+        physics: {
+          enabled: false,
+          stabilization: { enabled: true, iterations: 150, updateInterval: 20 },
+          forceAtlas2Based: {
+            gravitationalConstant: -52, centralGravity: 0.004,
+            springLength: 100, springConstant: 0.07, damping: 0.42, avoidOverlap: 0.4,
+          },
+          solver: "forceAtlas2Based",
+        },
+        nodes: {
+          shape: "dot", size: 11,
+          font: { size: 11, face: "-apple-system, Arial", color: "#e2e8f0" },
+          borderWidth: 2,
+        },
+        edges: {
+          smooth: { type: "continuous", roundness: 0.15 },
+          scaling:  { min: 1, max: 5 },
+          color:    { inherit: false },
+          hoverWidth: 2,
+        },
+        interaction: {
+          hover: true, tooltipDelay: 80,
+          hideEdgesOnDrag: true, zoomView: true,
+        },
+      }
+    );
+
+    // Disable physics after each layout run
+    network.on("stabilizationIterationsDone", () =>
+      network.setOptions({ physics: { enabled: false } }));
+
+    // ── state ──────────────────────────────────────────────────────────────────
+    let activeCid = null;
+
+    // ── helpers ────────────────────────────────────────────────────────────────
+    function esc(s) {
+      return String(s)
+        .replace(/&/g,"&amp;").replace(/</g,"&lt;")
+        .replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+    }
+
+    function renderTable(cid, focusNodeId) {
+      const rows = TD[cid] || [];
+      const area = document.getElementById("ta");
+      if (!rows.length) {
+        area.innerHTML = "<div class='hint'><p>No record data for this cluster.</p></div>";
+        return;
+      }
+      let h = "<table><thead><tr>"
+        + FL.map(f => `<th>${esc(f)}</th>`).join("")
+        + "</tr></thead><tbody>";
+      rows.forEach((row, i) => {
+        h += `<tr data-i="${i}">`;
+        FL.forEach(f => {
+          const v = row[f] != null ? String(row[f]) : "";
+          const s = v.length > 40 ? v.slice(0,40) + "…" : v;
+          h += `<td title="${esc(v)}">${esc(s)}</td>`;
+        });
+        h += "</tr>";
+      });
+      h += "</tbody></table>";
+      area.innerHTML = h;
+
+      // row click → focus node
+      area.querySelectorAll("tbody tr").forEach(tr => {
+        tr.addEventListener("click", () => {
+          area.querySelectorAll("tbody tr.sel").forEach(r => r.classList.remove("sel"));
+          tr.classList.add("sel");
+          const rid = rows[+tr.dataset.i][FL[0]];
+          network.selectNodes([rid]);
+          network.focus(rid, { scale: 1.6,
+            animation: { duration: 350, easingFunction: "easeInOutQuad" } });
+        });
+      });
+
+      // node click → highlight matching row
+      if (focusNodeId != null) {
+        const idx = rows.findIndex(r => String(r[FL[0]]) === String(focusNodeId));
+        if (idx >= 0) {
+          const tr = area.querySelectorAll("tbody tr")[idx];
+          if (tr) {
+            tr.classList.add("sel");
+            tr.scrollIntoView({ block: "nearest" });
+          }
+        }
+      }
+    }
+
+    function selectCluster(cid, color, focusNodeId) {
+      const switching = cid !== activeCid;
+      activeCid = cid;
+
+      if (switching) {
+        // Swap in only this cluster's nodes + edges
+        nodeset.clear();
+        edgeset.clear();
+        nodeset.add(nodesByCluster[cid] || []);
+        edgeset.add(edgesByCluster[cid] || []);
+        network.setOptions({ physics: { enabled: true } });
+        network.stabilize(150);
+      }
+
+      // Keep / restore node selection in the graph
+      if (focusNodeId != null) {
+        network.selectNodes([String(focusNodeId)]);
+        if (!switching) {
+          network.focus(String(focusNodeId), {
+            scale: 1.4, animation: { duration: 300, easingFunction: "easeInOutQuad" }
+          });
+        }
+      }
+
+      if (switching) {
+        // info card
+        const ct = document.getElementById("ct");
+        ct.innerHTML = `<span class="dot" style="background:${color}"></span>${esc(cid)}`;
+        ct.style.color = "";
+        const rows = TD[cid] || [];
+        const cs = document.getElementById("cs");
+        cs.textContent = `${rows.length} record${rows.length !== 1 ? "s" : ""}`;
+        cs.style.color = "";
+
+        // cluster list highlight
+        document.querySelectorAll(".ci").forEach(el =>
+          el.classList.toggle("active", el.dataset.cid === cid));
+      }
+
+      renderTable(cid, focusNodeId);
+    }
+
+    function clearSelection() {
+      activeCid = null;
+      nodeset.clear();
+      edgeset.clear();
+      const ct = document.getElementById("ct");
+      ct.textContent = "None"; ct.style.color = "#4a5568";
+      const cs = document.getElementById("cs");
+      cs.textContent = "Click a node or choose a cluster below"; cs.style.color = "#4a5568";
+      document.querySelectorAll(".ci").forEach(el => el.classList.remove("active"));
+      document.getElementById("ta").innerHTML =
+        "<div class='hint'><p><strong>No cluster selected</strong>" +
+        "Click any node in the graph, or pick a cluster from the list above.</p></div>";
+    }
+
+    // ── network events ─────────────────────────────────────────────────────────
+    network.on("click", params => {
+      if (params.nodes.length) {
+        const node = nodeIdx[params.nodes[0]];
+        if (node) {
+          const entry = CL.find(c => c.id === node.cluster_id);
+          selectCluster(node.cluster_id, entry ? entry.color : "#97c2fc", node.id);
+        }
+      } else {
+        clearSelection();
+      }
+    });
+
+    // ── cluster list ───────────────────────────────────────────────────────────
+    const clEl = document.getElementById("cl");
+    clEl.innerHTML = CL.map(c =>
+      `<div class="ci" data-cid="${esc(c.id)}">
+         <span class="dot" style="background:${c.color}"></span>
+         <span class="ci-id">${esc(c.id)}</span>
+         <span class="ci-sz">${c.size} records</span>
+       </div>`
+    ).join("");
+
+    clEl.querySelectorAll(".ci").forEach(el => {
+      el.addEventListener("click", () => {
+        const cid = el.dataset.cid;
+        const entry = CL.find(c => c.id === cid);
+        selectCluster(cid, entry ? entry.color : "#97c2fc");
+      });
+    });
+
+    // ── resizable split ────────────────────────────────────────────────────────
+    const rzr = document.getElementById("rzr");
+    const gp  = document.getElementById("gp");
+    const sb  = document.getElementById("sb");
+    const bod = document.getElementById("body");
+    let resizing = false;
+
+    rzr.addEventListener("mousedown", e => {
+      resizing = true;
+      rzr.classList.add("drag");
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+      e.preventDefault();
+    });
+
+    document.addEventListener("mousemove", e => {
+      if (!resizing) return;
+      const rect  = bod.getBoundingClientRect();
+      const pct   = Math.min(Math.max((e.clientX - rect.left) / rect.width * 100, 20), 80);
+      gp.style.flex = `0 0 ${pct}%`;
+      sb.style.flex = `0 0 ${100 - pct}%`;
+      network.redraw();
+    });
+
+    document.addEventListener("mouseup", () => {
+      if (!resizing) return;
+      resizing = false;
+      rzr.classList.remove("drag");
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      network.redraw();
+    });
+  </script>
+</body>
+</html>"""
 
 
 # Example usage
