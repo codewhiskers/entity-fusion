@@ -7,6 +7,7 @@ from pathlib import Path
 import math
 import json
 import warnings
+import time
 from datetime import datetime
 
 import polars as pl
@@ -108,6 +109,27 @@ class IncrementalSignalLinker:
             stacklevel=2,
         )
 
+    def _log_stage(
+        self,
+        stage: str,
+        started_at: float,
+        *,
+        extra: Optional[str] = None,
+    ) -> float:
+        """
+        Print a simple stage timing message when progress reporting is enabled.
+
+        Returns a fresh timestamp so callers can chain stages as:
+            t = time.perf_counter()
+            ...
+            t = self._log_stage("Built aliases", t)
+        """
+        if self.show_progress:
+            elapsed = time.perf_counter() - started_at
+            suffix = f" | {extra}" if extra else ""
+            print(f"[IncrementalSignalLinker] {stage} in {elapsed:.2f}s{suffix}")
+        return time.perf_counter()
+
     # ------------------------ Enhanced Public API ------------------------
 
     def link_incremental(
@@ -117,6 +139,7 @@ class IncrementalSignalLinker:
             batch_id = datetime.now().isoformat()
 
         self._block_warnings = []
+        stage_started = time.perf_counter()
         df = self._to_polars(records)
         self._specs = self._compile_alias_specs(self.blocking_plan)
         include = self.include_types or list(self._specs.keys())
@@ -124,6 +147,11 @@ class IncrementalSignalLinker:
         # Build alias rows for THIS batch
         alias_curr = self._build_alias_value(df, include).with_columns(
             pl.lit(batch_id).alias("batch_id")
+        )
+        stage_started = self._log_stage(
+            "Built alias rows",
+            stage_started,
+            extra=f"rows={alias_curr.height}",
         )
 
         # Build IDF index on history+current to keep scoring stable across time
@@ -142,6 +170,11 @@ class IncrementalSignalLinker:
         else:
             n_records_total = df.select(pl.col(self.record_id_col).n_unique()).item()
             alias_index = self._build_alias_index(alias_curr, n_records_total)
+        stage_started = self._log_stage(
+            "Built alias index",
+            stage_started,
+            extra=f"records={n_records_total}",
+        )
 
         pairs_parts: List[pl.DataFrame] = []
 
@@ -165,6 +198,11 @@ class IncrementalSignalLinker:
                 )
                 if p_cross.height:
                     pairs_parts.append(p_cross)
+        stage_started = self._log_stage(
+            "Generated candidate pairs",
+            stage_started,
+            extra=f"signal_tables={len(pairs_parts)}",
+        )
 
         # Candidate filtering: AND/OR tree takes precedence over K-of-N
         if self._is_condition_tree(self.blocking_plan):
@@ -172,20 +210,45 @@ class IncrementalSignalLinker:
             pairs_long = self._apply_condition_filter(pairs_long, self.blocking_plan)
         else:
             pairs_long = self._candidates_k_of_n(pairs_parts, self.k_required)
+        stage_started = self._log_stage(
+            "Filtered candidate pairs",
+            stage_started,
+            extra=f"rows={pairs_long.height}",
+        )
         pairs_scored = self._score_pairs(pairs_long, alias_index)
+        stage_started = self._log_stage(
+            "Scored pairs",
+            stage_started,
+            extra=f"rows={pairs_scored.height}",
+        )
         final_pairs = self._select_pairs(
             pairs_scored, threshold=self.select_threshold, quantile=self.select_quantile
+        )
+        stage_started = self._log_stage(
+            "Selected final pairs",
+            stage_started,
+            extra=f"rows={final_pairs.height}",
         )
 
         # Update clusters + history
         if final_pairs.height > 0 and self.enable_incremental:
             self._update_clusters(final_pairs, batch_id)
+        stage_started = self._log_stage(
+            "Updated clusters",
+            stage_started,
+            extra=f"clusters={len(self._clusters)}",
+        )
 
         # Persist alias signatures
         self._alias_store = (
             pl.concat([self._alias_store, alias_curr], how="vertical").unique()
             if self._alias_store.height
             else alias_curr
+        )
+        stage_started = self._log_stage(
+            "Updated alias store",
+            stage_started,
+            extra=f"rows={self._alias_store.height}",
         )
 
         out = {
@@ -196,6 +259,7 @@ class IncrementalSignalLinker:
 
         if self.create_network:
             out["network"] = self._build_network_graph(out)
+            stage_started = self._log_stage("Built network output", stage_started)
         out["clusters"] = self.get_clusters()
         out["cluster_stats"] = self.get_cluster_stats()
         out["labeled_records"] = self._label_records(df)
@@ -212,6 +276,8 @@ class IncrementalSignalLinker:
         if self.return_intermediates:
             out.update({"alias_store": self._alias_store})
 
+        self._log_stage("Finished link_incremental", stage_started)
+
         return out
 
     def link(self, records: RecordFrame) -> Dict[str, pl.DataFrame]:
@@ -220,13 +286,24 @@ class IncrementalSignalLinker:
         """
         df = self._to_polars(records)
         self._block_warnings = []
+        stage_started = time.perf_counter()
         self._specs = self._compile_alias_specs(self.blocking_plan)
 
         include = self.include_types or list(self._specs.keys())
 
         alias_value = self._build_alias_value(df, include)
+        stage_started = self._log_stage(
+            "Built alias rows",
+            stage_started,
+            extra=f"rows={alias_value.height}",
+        )
         n_records = df.select(pl.col(self.record_id_col).n_unique()).item()
         alias_index = self._build_alias_index(alias_value, n_records)
+        stage_started = self._log_stage(
+            "Built alias index",
+            stage_started,
+            extra=f"records={n_records}",
+        )
 
         # Include existing matches if incremental mode
         pairs_parts: List[pl.DataFrame] = []
@@ -240,15 +317,35 @@ class IncrementalSignalLinker:
             p = self._pairs_from_alias_type(alias_value, t)
             if p.height:
                 pairs_parts.append(p)
+        stage_started = self._log_stage(
+            "Generated candidate pairs",
+            stage_started,
+            extra=f"signal_tables={len(pairs_parts)}",
+        )
 
         if self._is_condition_tree(self.blocking_plan):
             pairs_long = self._candidates_k_of_n(pairs_parts, 1)
             pairs_long = self._apply_condition_filter(pairs_long, self.blocking_plan)
         else:
             pairs_long = self._candidates_k_of_n(pairs_parts, self.k_required)
+        stage_started = self._log_stage(
+            "Filtered candidate pairs",
+            stage_started,
+            extra=f"rows={pairs_long.height}",
+        )
         pairs_scored = self._score_pairs(pairs_long, alias_index)
+        stage_started = self._log_stage(
+            "Scored pairs",
+            stage_started,
+            extra=f"rows={pairs_scored.height}",
+        )
         final_pairs = self._select_pairs(
             pairs_scored, threshold=self.select_threshold, quantile=self.select_quantile
+        )
+        stage_started = self._log_stage(
+            "Selected final pairs",
+            stage_started,
+            extra=f"rows={final_pairs.height}",
         )
 
         out = {
@@ -264,6 +361,7 @@ class IncrementalSignalLinker:
 
         if self.return_intermediates:
             out.update({"alias_value": alias_value, "alias_index": alias_index})
+        self._log_stage("Finished link", stage_started)
         return out
 
     def _pairs_cross_from_alias_type(
