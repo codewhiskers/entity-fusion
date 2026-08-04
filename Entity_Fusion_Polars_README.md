@@ -229,6 +229,12 @@ A few things worth knowing:
 
 `preview_blocks(df)` returns `(match_column, block, value, n_hash_ids)`, sorted largest-first — call it before `cluster()` on a new dataset to catch a runaway value up front.
 
+`block` is the extra `block_on` scope, not the identifier value itself. If a
+match column has no `block_on`, `block` is an empty string; that still represents a
+real candidate-generation block keyed by `(match_column, value)`. With `block_on`,
+the block key becomes `(match_column, block, value)`, where `block` is the joined
+scope value.
+
 ## Examples
 
 ### Requiring agreement across columns (K-of-N)
