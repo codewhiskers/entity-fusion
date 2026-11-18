@@ -2,6 +2,15 @@
 
 Entity Fusion is a record-linkage / entity-resolution project for grouping rows that likely refer to the same real-world entity.
 
+## Standalone Polars Transitive Clustering
+
+[transitive_fusion.py](./transitive_fusion.py) provides exact transitive clustering
+with nested `and`, `or`, and `at_least` rules, field-level blockers, and HTML
+cluster reviews. It requires only Polars.
+
+See the [Transitive Clustering README](./Transitive_Fusion_README.md) for usage,
+rule syntax, review options, and benchmark results on 968,512 records.
+
 The current core implementation lives in [Incremental_Fusion.py](./Incremental_Fusion.py). It supports:
 
 - exact and fuzzy matching signals
