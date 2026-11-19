@@ -10,6 +10,7 @@ from itertools import combinations, product
 import json
 import math
 from pathlib import Path
+from typing import Union
 
 import polars as pl
 
@@ -20,65 +21,158 @@ def _present(value):
     )
 
 
-def _compile_rule(rule, path="rule"):
-    """Return canonical rule and sufficient sets of leaf conditions (DNF)."""
-    if not isinstance(rule, dict):
+@dataclass(frozen=True, order=True)
+class _FieldCondition:
+    field: str
+    block_on: tuple[str, ...] = ()
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        return (self.field, *self.block_on)
+
+    def as_dict(self) -> dict:
+        return {"field": self.field, "block_on": list(self.block_on)}
+
+    def describe(self) -> str:
+        suffix = " [block_on: " + ", ".join(self.block_on) + "]" if self.block_on else ""
+        return self.field + suffix
+
+
+@dataclass(frozen=True)
+class _ThresholdGroup:
+    """All logical groups share threshold semantics; retain syntax for reports."""
+
+    at_least: int
+    conditions: tuple[_RuleNode, ...]
+    operator: str
+    path: str
+
+    def as_dict(self) -> dict:
+        children = [condition.as_dict() for condition in self.conditions]
+        if self.operator == "at_least":
+            return {"at_least": self.at_least, "conditions": children}
+        return {self.operator: children}
+
+
+_RuleNode = Union[_FieldCondition, _ThresholdGroup]
+_ExactTerm = frozenset[_FieldCondition]
+
+
+def _parse_rule(config: dict, path: str = "rule") -> _RuleNode:
+    """Validate syntax and construct a rule tree without expanding combinations."""
+    if not isinstance(config, dict):
         raise ValueError(f"{path}: condition must be a dictionary")
-    if "field" in rule:
-        if set(rule) - {"field", "block_on"}:
+    if "field" in config:
+        if set(config) - {"field", "block_on"}:
             raise ValueError(f"{path}: unexpected field options")
-        field = rule["field"]
-        blockers = rule.get("block_on", [])
-        if not isinstance(field, str) or not field:
+        name = config["field"]
+        blockers = config.get("block_on", [])
+        if not isinstance(name, str) or not name:
             raise ValueError(f"{path}: field must be a nonempty string")
         if (not isinstance(blockers, (list, tuple)) or
                 any(not isinstance(c, str) or not c for c in blockers) or
-                len(set(blockers)) != len(blockers) or field in blockers):
+                len(set(blockers)) != len(blockers) or name in blockers):
             raise ValueError(f"{path}: block_on must contain distinct other column names")
-        leaf = (field, tuple(sorted(blockers)))
-        return {"field": field, "block_on": list(leaf[1])}, {frozenset([leaf])}
-    operators = set(rule) & {"and", "or", "at_least"}
+        return _FieldCondition(name, tuple(sorted(blockers)))
+
+    operators = set(config) & {"and", "or", "at_least"}
     if len(operators) != 1:
         raise ValueError(f"{path}: use exactly one of and, or, at_least")
-    op = next(iter(operators))
-    if set(rule) != ({"at_least", "conditions"} if op == "at_least" else {op}):
+    operator = next(iter(operators))
+    expected_keys = {"at_least", "conditions"} if operator == "at_least" else {operator}
+    if set(config) != expected_keys:
         raise ValueError(f"{path}: unexpected group options")
-    children = rule.get("conditions") if op == "at_least" else rule[op]
+    children = config["conditions"] if operator == "at_least" else config[operator]
     if not isinstance(children, (list, tuple)) or not children:
         raise ValueError(f"{path}: group must have nonempty conditions")
-    threshold = rule[op] if op == "at_least" else (1 if op == "or" else len(children))
+    threshold = config[operator] if operator == "at_least" else (1 if operator == "or" else len(children))
     if type(threshold) is not int or not 1 <= threshold <= len(children):
         raise ValueError(f"{path}: at_least must be an integer from 1 to the child count")
-    parsed = [_compile_rule(child, f"{path}.{i}") for i, child in enumerate(children)]
-    signatures = [frozenset(child_terms) for _, child_terms in parsed]
-    if len(set(signatures)) != len(signatures):
-        raise ValueError(f"{path}: duplicate conditions would count the same evidence twice")
-    terms = set()
-    for selected in combinations(parsed, threshold):
-        for parts in product(*(terms_ for _, terms_ in selected)):
-            terms.add(frozenset().union(*parts))
-            if len(terms) > 10000:
-                raise ValueError("rule expands to too many combinations; simplify the rule")
-    # Remove redundant supersets, e.g. A OR (A AND B).
-    minimal = set()
+    conditions = tuple(_parse_rule(child, f"{path}.{i}") for i, child in enumerate(children))
+    return _ThresholdGroup(threshold, conditions, operator, path)
+
+
+def _rule_leaves(rule: _RuleNode) -> set[_FieldCondition]:
+    if isinstance(rule, _FieldCondition):
+        return {rule}
+    return set().union(*(_rule_leaves(child) for child in rule.conditions))
+
+
+@dataclass(frozen=True)
+class _ExactMatchGroup:
+    """One sufficient conjunction, executed by a single Polars grouping pass."""
+
+    conditions: tuple[_FieldCondition, ...]
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        return tuple(sorted({column for condition in self.conditions for column in condition.columns}))
+
+
+@dataclass(frozen=True)
+class _ExactMatchPlan:
+    rule: _RuleNode
+    groups: tuple[_ExactMatchGroup, ...]
+    leaves: tuple[_FieldCondition, ...]
+
+
+@dataclass
+class _CompilationBudget:
+    max_terms: int
+    remaining_work: int
+
+    def spend(self) -> None:
+        self.remaining_work -= 1
+        if self.remaining_work < 0:
+            raise ValueError("rule compilation exceeds work limit; simplify the rule")
+
+
+def _minimal_terms(terms: set[_ExactTerm], budget: _CompilationBudget) -> set[_ExactTerm]:
+    """Discard redundant supersets, e.g. A OR (A AND B)."""
+    by_size = defaultdict(set)
     for term in sorted(terms, key=len):
-        if not any(other <= term for other in minimal):
-            minimal.add(term)
-    canonical = ({"at_least": threshold, "conditions": [n for n, _ in parsed]}
-                 if op == "at_least" else {op: [n for n, _ in parsed]})
-    return canonical, minimal
+        smaller = (other for size, group in by_size.items() if size < len(term) for other in group)
+        for other in smaller:
+            budget.spend()
+            if other <= term:
+                break
+        else:
+            by_size[len(term)].add(term)
+    return set().union(*by_size.values())
 
 
-def _leaf_description(leaf):
-    field, blockers = leaf
-    return field + (" [block_on: " + ", ".join(blockers) + "]" if blockers else "")
+def _expand_exact_terms(rule: _RuleNode, budget: _CompilationBudget) -> set[_ExactTerm]:
+    if isinstance(rule, _FieldCondition):
+        return {frozenset([rule])}
+    children = [_expand_exact_terms(child, budget) for child in rule.conditions]
+    signatures = [frozenset(terms) for terms in children]
+    if len(set(signatures)) != len(signatures):
+        raise ValueError(f"{rule.path}: duplicate conditions would count the same evidence twice")
+    terms = set()
+    for selected in combinations(children, rule.at_least):
+        for parts in product(*selected):
+            # Count generated combinations, including duplicates, not just stored terms.
+            budget.spend()
+            terms.add(frozenset().union(*parts))
+            if len(terms) > budget.max_terms:
+                raise ValueError("rule expands to too many combinations; simplify the rule")
+    return _minimal_terms(terms, budget)
 
 
-def _rule_leaves(rule):
-    if "field" in rule:
-        return {(rule["field"], tuple(rule["block_on"]))}
-    children = rule.get("conditions", rule.get("and", rule.get("or")))
-    return set().union(*(_rule_leaves(child) for child in children))
+def _compile_exact_rule(
+    rule: _RuleNode, *, max_terms: int = 10000, max_work: int = 1000000,
+) -> _ExactMatchPlan:
+    """Compile a parsed tree into deterministic sufficient exact-match groups.
+
+    Equivalent child conditions are rejected so a threshold cannot count the
+    same logical evidence twice. Expansion and subsumption share a work budget
+    across the whole tree, including combinations that deduplicate away.
+    """
+    budget = _CompilationBudget(max_terms, max_work)
+    terms = _expand_exact_terms(rule, budget)
+    groups = tuple(_ExactMatchGroup(tuple(sorted(term)))
+                   for term in sorted(terms, key=lambda term: sorted(term)))
+    return _ExactMatchPlan(rule, groups, tuple(sorted(_rule_leaves(rule))))
 
 
 @dataclass
@@ -146,9 +240,16 @@ def cluster_entities(
         if len(set(columns)) != len(columns):
             raise ValueError("match_columns must not contain duplicates")
         match_rule = {"at_least": min_matches, "conditions": [{"field": c} for c in columns]}
-    rule, terms = _compile_rule(match_rule)
-    leaves = sorted(_rule_leaves(rule))
-    columns = sorted({c for field, blockers in leaves for c in (field, *blockers)})
+    rule = _parse_rule(match_rule)
+    plan = _compile_exact_rule(rule)
+    return _execute_exact_plan(df, plan, cluster_column, return_details)
+
+
+def _execute_exact_plan(
+    df: pl.DataFrame, plan: _ExactMatchPlan, cluster_column: str, return_details: bool,
+) -> pl.DataFrame | FusionResult:
+    """Execute grouping and union-find independently of rule parsing/expansion."""
+    columns = sorted({column for leaf in plan.leaves for column in leaf.columns})
     missing = set(columns) - set(df.columns)
     if missing:
         raise ValueError(f"missing match or blocker columns: {sorted(missing)}")
@@ -191,8 +292,8 @@ def cluster_entities(
 
     evidence = []
     if df.height > 1:
-        for term in sorted(terms, key=lambda t: sorted(t)):
-            fields = sorted({c for field, blockers in term for c in (field, *blockers)})
+        for match_group in plan.groups:
+            fields = match_group.columns
             groups = (keys.filter(pl.all_horizontal([valid[c] for c in fields]))
                       .group_by([aliases[c] for c in fields])
                       .agg(pl.col("row_position"))
@@ -204,7 +305,7 @@ def cluster_entities(
                 if return_details:
                     evidence.append({
                         "row_positions": members,
-                        "conditions": [_leaf_description(leaf) for leaf in sorted(term)],
+                        "conditions": [condition.describe() for condition in match_group.conditions],
                         "shared_values": json.dumps({c: group[aliases[c]] for c in fields}, default=str),
                     })
     labels = [earliest[find(i)] for i in range(df.height)]
@@ -218,8 +319,8 @@ def cluster_entities(
     schema = {"group_id": pl.UInt64, cluster_column: pl.UInt64,
               "row_positions": pl.List(pl.UInt64), "conditions": pl.List(pl.String),
               "shared_values": pl.String}
-    return FusionResult(records, pl.DataFrame(evidence, schema=schema), rule, cluster_column,
-                        tuple(sorted({field for field, _ in leaves})))
+    return FusionResult(records, pl.DataFrame(evidence, schema=schema), plan.rule.as_dict(), cluster_column,
+                        tuple(sorted({leaf.field for leaf in plan.leaves})))
 
 
 def _bridges(adjacency):

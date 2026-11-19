@@ -1,5 +1,19 @@
 # Polars Transitive Entity Clustering
 
+## Interactive Notebook
+
+Open [Test_Transitive_Fusion.ipynb](./Test_Transitive_Fusion.ipynb) and run cells
+in order with a kernel containing `polars`, `scikit-learn`, and `sparse_dot_topn`.
+It covers simple K-of-N matching, nested rules/blockers, exact match evidence,
+name-review tables, HTML exports, and a saved synthetic manual split.
+
+The real-data configuration defaults to the first 10,000 rows of the local
+`100k.parquet` and its ten largest clusters. Set `ROW_LIMIT=None` for the full file
+and `REVIEW_MAX_CLUSTERS=None` for every nonsingleton cluster. Tables are exported
+in full; HTML is limited to `REPORT_TOP_N` clusters. Notebook artifacts go under
+`test_data/_debug_outputs/transitive_notebook/`. The real-data experiment does not
+apply splits, and its generated record IDs are specific to that extraction.
+
 For exact ID matching without the larger linker's dependencies or configuration,
 use [transitive_fusion.py](./transitive_fusion.py). It requires only Polars.
 
@@ -137,10 +151,31 @@ and matching values for selected clusters and can grow with large clusters.
 contains the actual identifiers used for review. Nested/object columns are allowed
 in display tables, but matching and conflict checks require scalar columns.
 
-Complex rules compile into sufficient combinations (limited to 10,000 per group).
-Each combination requires a grouping pass, so keep rule trees modest. Graphs may
+Complex rules compile into sufficient combinations (limited to 10,000 at each
+rule-tree group). Compilation also has a shared work limit of 1,000,000 generated
+combinations and subset comparisons across the tree, including combinations that
+deduplicate away. Rules exceeding either limit raise `ValueError` before execution.
+Each sufficient combination requires a grouping pass, so keep rule trees modest. Graphs may
 have quadratic edge counts, bounded by the chosen `max_records` limit. The
 clustering itself and stored evidence avoid quadratic pair materialization.
+
+Internally, rule handling has three separate steps:
+
+1. `_parse_rule` validates the dictionary and builds immutable field conditions
+   and threshold groups. `and` and `or` use the same threshold model while
+   retaining their original operator names for report output. Parsing does not
+   expand combinations.
+2. `_compile_exact_rule` turns that tree into an exact-match plan. It rejects
+   logically equivalent sibling conditions, removes redundant combinations, and
+   applies the compilation limits. The plan retains all referenced fields for
+   input validation, including fields removed from the execution combinations.
+3. `_execute_exact_plan` validates input columns and runs Polars grouping and
+   union-find using the plan, retaining compact evidence when requested.
+
+These are internal interfaces; the public `cluster_entities` arguments, return
+types, rule dictionaries, and HTML export API are unchanged. The separation lets
+future comparison methods reuse the parsed rule structure without requiring them
+to use exact grouping plans.
 
 Try a synthetic overcluster example:
 
@@ -242,3 +277,233 @@ are written under `test_data/_debug_outputs/transitive_benchmark/`:
 
 For a quick smoke test, add `--limit 10000`; output filenames use the actual row
 count. The benchmark script is [examples/benchmark_transitive_fusion.py](./examples/benchmark_transitive_fusion.py).
+
+## Name Review And Explicit Cluster Splits
+
+[transitive_review.py](./transitive_review.py) adds a separate evaluation/refinement
+layer. The exact clustering module still requires only Polars. Name evaluation
+additionally requires `scikit-learn` and `sparse_dot_topn` (v1 API). Its retrieval
+uses [`sp_matmul_topn`](https://github.com/ing-bank/sparse_dot_topn#usage).
+
+```bash
+pip install scikit-learn sparse_dot_topn
+python examples/name_refinement.py
+# Review the ten largest clusters from the full local PPP file:
+python examples/name_refinement.py --input test_data/100k.parquet
+# Evaluate every nonsingleton cluster; keep HTML limited to the ten largest:
+python examples/name_refinement.py --input test_data/100k.parquet --all-clusters \
+    --output-dir test_data/_debug_outputs/name_refinement_full
+```
+
+These commands write review HTML, Parquet tables, and configuration/summary JSON
+under `test_data/_debug_outputs/name_refinement/`. The synthetic example also
+applies an explicit illustrative reviewer decision and saves refined records and
+crossing evidence. The PPP example makes **no membership changes**. Its generated
+row IDs are for that extraction only; supply `--record-id-column` with a unique
+source ID when available for durable review decisions.
+
+With `--all-clusters`, complete review tables are written for every cluster with
+at least two records. Singletons remain in `ppp_labeled_records.parquet` but are
+not name-evaluated. `ppp_match_groups.parquet` retains the original exact evidence.
+The HTML includes only the ten largest evaluated clusters. Because TF-IDF is fit
+over all evaluated usable names, scores can differ from the ten-cluster preview.
+
+Full-file name review on November 18, 2026 (`threshold=0.85`):
+
+| Measurement | Result |
+|---|---:|
+| Input rows | 968,512 |
+| Nonsingleton clusters evaluated | 127,906 |
+| Records evaluated | 284,188 |
+| Input loading plus exact clustering | 4.34 s |
+| Name evaluation | 44.11 s |
+| Clusters flagged for review | 31,648 (24.74%) |
+| Records with a name neighbor above threshold | 219,785 |
+| Records below the name threshold | 64,402 |
+| Records with missing names | 1 |
+| Retrieved name pairs | 255,252 |
+
+All evaluated clusters were small enough for complete positive-pair comparisons,
+so this run's name component counts were not truncated by top-N retrieval.
+Original memberships were preserved; pair endpoints were verified to belong to
+their assigned original clusters, and there were no self matches. The 31,648
+flags identify multiple name groups, not confirmed errors. No manual split was
+applied. Outputs are under `test_data/_debug_outputs/name_refinement_full/`;
+the HTML shows ten clusters, while Parquet contains the full evaluation.
+
+### Name Evaluation Performance
+
+The evaluator now computes sparse-vector feature presence once, batches dot
+products for clusters with exactly two usable names, and skips neighbor-search
+setup for singletons or clusters with fewer than two usable names. Singletons
+still receive review rows when `min_cluster_size=1` and remain part of TF-IDF
+fitting, preserving the selected evaluation corpus and score interpretation.
+
+Local measurements on November 18, 2026:
+
+| Input | Minimum cluster size | Before | Optimized | Comparison |
+|---|---:|---:|---:|---|
+| First 100,000 rows | 2 | 3.03 s | 1.05 s | Back-to-back; 2.9× faster |
+| First 100,000 rows | 1 | 18.30 s | 3.55 s | Back-to-back; 5.2× faster |
+| Full 968,512 rows | 2 | 44.11 s | 12.55 s | Earlier full run versus optimized run |
+
+All four output tables matched the prior implementation on both sample scopes
+and the saved full-file evaluation, with a `1e-12` tolerance for numeric scores.
+Flags, proposed memberships, coverage, and the full-file 31,648 review count were
+unchanged. Timings exclude exact clustering and HTML generation; the sample
+comparison used warmed imports. This is an implementation optimization, not a
+reduction in evaluation coverage or a new scoring policy. Threshold changes still
+recompute vectors and similarities; cross-call caching is not implemented.
+
+If the evaluator is already imported in a running notebook, reload it before
+measuring the updated implementation:
+
+```python
+import importlib
+import transitive_review
+importlib.reload(transitive_review)
+evaluate_clusters = transitive_review.evaluate_clusters
+```
+
+### Evaluate Without Changing Membership
+
+Given an input `df` with a unique, nonmissing stable `record_id`, a string `name`,
+and identifier columns:
+
+```python
+from transitive_fusion import cluster_entities
+from transitive_review import evaluate_clusters, apply_cluster_splits
+
+fusion = cluster_entities(df, ["ein", "phone"], return_details=True)
+review = evaluate_clusters(
+    fusion,
+    name_column="name",
+    record_id_column="record_id",
+    threshold=0.85,
+    top_n=10,
+    complete_limit=100,
+    min_cluster_size=2,
+    max_clusters=10,  # None evaluates all qualifying clusters
+)
+review.export_html("name_review.html", fusion=fusion)
+review.records.write_parquet("record_review.parquet")
+review.clusters.write_parquet("cluster_review.parquet")
+review.name_pairs.write_parquet("name_pairs.parquet")
+review.proposed_splits.write_parquet("proposed_splits.parquet")
+```
+
+The tables have distinct purposes:
+
+| Table | Contents |
+|---|---|
+| `fusion.records` | Original records plus unchanged exact `cluster_id`. |
+| `fusion.match_groups` | Exact rule evidence behind the original cluster. |
+| `review.records` | Record ID, name, original cluster, best neighbor and score, name status, threshold support, and proposed subgroup. |
+| `review.clusters` | Counts, threshold, supported fraction, unsupported names, component counts, retrieval completeness, and review reasons. |
+| `review.name_pairs` | Retrieved within-cluster pairs, cosine similarities, and threshold decisions. |
+| `review.proposed_splits` | Proposed memberships by record ID; these are not accepted decisions. |
+
+Review tables use fixed `record_id` and `cluster_id` column names, even if the
+input uses different names. Names are lowercased and whitespace-normalized for
+comparison, but original names are retained in the record table. TF-IDF character
+word-boundary n-grams of lengths 2–4 are fitted over usable names in the selected
+clusters. Changing the selected corpus can change similarity scores; scores are
+not probabilities and 0.85 is an exploratory setting, not a calibrated cutoff.
+
+Comparisons never cross original cluster boundaries. Clusters up to
+`complete_limit` retrieve all positive pair scores. Larger clusters retain up to
+`top_n` neighbors per record, excluding self; the union of both directions forms
+the review graph. Best-neighbor scores below the threshold are retained, too.
+The `graph_complete` flag distinguishes complete comparisons from a top-N graph,
+whose component count may overstate fragmentation by omitting qualifying links.
+
+`name_component_count` counts threshold-connected groups among usable names;
+`proposed_component_count` additionally includes separate proposals for records
+with missing/unusable names. Similarity components allow transitive chains:
+not every pair in a proposed group must meet the threshold. Missing names,
+singletons, and records without another comparable name have separate statuses
+and null similarities. A usable name with comparable peers but no shared features
+has similarity zero. `unsupported_name_count` counts usable names without
+threshold support only when at least two usable names exist.
+
+A cluster can have 100% supported names yet contain two internally consistent,
+mutually dissimilar groups; inspect component counts alongside supported fraction.
+The offline HTML dashboard has searchable, sortable, paginated tables. Select a
+cluster in **Cluster diagnostics** (or enter an exact cluster ID) to filter its
+records, name comparisons, and exact evidence together. Search can also find
+clusters by member name or review reason. Headers use readable display labels;
+Parquet column names are unchanged. Selecting a record focuses the shared-value
+and name-comparison tables on its connections.
+
+Pass `fusion=fusion` to `review.export_html(...)` to include source columns,
+original matching rules, shared-value groups with member names/IDs, and a path
+lookup explaining indirect exact connections. Without `fusion`, the dashboard
+still supports name review and explicitly indicates that exact evidence was not
+included. Name similarity is kept separate from the original exact-match reasons.
+The notebook and example runner supply `fusion` automatically.
+
+The **Why did these records cluster?** section includes an offline force-directed
+graph. Circles are records, colored by their proposed name group; diamonds are
+exact match groups labeled with their shared values. Links represent membership
+in a match group, rather than every possible record pair. Hover nodes for full
+names, IDs, matching conditions, and values. Selecting a record highlights its
+connections; selecting a diamond filters the tables to that group's members and
+evidence. The connection-path tool highlights the corresponding graph path.
+Drag nodes to arrange them, drag the background to pan, scroll or use buttons to
+zoom, and pause/resume the layout as needed. The graph is embedded in the HTML
+and needs no CDN or additional Python package.
+For larger graphs, record labels appear on hover, keyboard focus, or selected
+paths to reduce clutter; use **Show record labels** to display them all.
+
+Graph previews are bounded at 150 records, 100 match groups, and 1,500 membership
+links. Any omissions are explicitly labeled; missing visual links do not imply
+that records are disconnected. The tables and path lookup still use the complete
+exported evidence. Node colors show name-review proposals, not accepted splits
+or the reason for the original exact match.
+
+Every supplied review row is embedded; pagination does not reduce file size.
+For large inputs, restrict HTML to selected clusters and use Parquet for fuller
+analysis. The example exports the ten largest evaluated clusters; an ID outside
+that exported scope will not appear in the dashboard. A separate exact-evidence
+report with graphs is still available.
+
+### Accept And Persist A Reviewed Split
+
+An accepted decision table has three columns:
+
+| record_id | refined_cluster_id | reason |
+|---|---|---|
+| A | FI-NORTH | Reviewer confirmed separate institutions |
+| B | FI-NORTH | Reviewer confirmed separate institutions |
+| C | FI-DESERT | Reviewer confirmed separate institutions |
+| D | FI-DESERT | Reviewer confirmed separate institutions |
+
+Every current record in an affected original cluster must have an assignment.
+The groups must actually split that cluster, and refined IDs cannot combine
+records from different original clusters. Missing names need explicit reviewer
+assignments rather than automatic placement.
+
+```python
+# decisions is an explicitly reviewed Polars DataFrame with the schema above.
+decisions.write_parquet("accepted_splits.parquet")
+split = apply_cluster_splits(fusion, decisions, record_id_column="record_id")
+split.records.write_parquet("refined_records.parquet")
+split.crossing_evidence.write_parquet("overridden_exact_evidence.parquet")
+```
+
+`split.records` preserves every input field and original cluster ID, appending
+`refined_cluster_id`. Unreviewed clusters receive `original:<cluster_id>` labels;
+accepted groups retain their reviewer-provided labels. These unreviewed fallback
+labels are run-specific, not persistent entity IDs. `split.decisions` retains the
+accepted decision table. `split.crossing_evidence` contains exact match groups
+whose members now span refined groups, including the shared values and refined
+labels. This explicitly exposes overrides of strong identifiers; no identifier
+is automatically protected or overridden based on its name.
+
+Reapply saved decisions explicitly after each clustering run. Assignments follow
+stable record IDs rather than row order. Unknown record IDs, duplicate IDs,
+new members without assignments in affected clusters, and cross-cluster merges
+raise errors so changed data needs review. Decisions are not a persistent registry
+or constraints enforced inside the original clustering algorithm; they are a
+separate post-clustering membership assignment. Save each run's original evidence
+and accepted decisions for audit history.

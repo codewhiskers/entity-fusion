@@ -10,6 +10,8 @@ cluster reviews. It requires only Polars.
 
 See the [Transitive Clustering README](./Transitive_Fusion_README.md) for usage,
 rule syntax, review options, and benchmark results on 968,512 records.
+Use [Test_Transitive_Fusion.ipynb](./Test_Transitive_Fusion.ipynb) to experiment
+with matching rules, name diagnostics, HTML reports, and reviewed splits.
 
 The current core implementation lives in [Incremental_Fusion.py](./Incremental_Fusion.py). It supports:
 

@@ -188,5 +188,57 @@ class RuleAndReviewTests(unittest.TestCase):
             self.assertIn("No clusters meet", path.read_text())
 
 
+class RuleCompilationTests(unittest.TestCase):
+    def test_parse_normalizes_groups_without_expanding(self):
+        from transitive_fusion import _parse_rule, _compile_exact_rule
+        # Parsing remains cheap even when an exact grouping plan would be too big.
+        config = {"at_least": 10, "conditions": [{"field": f"id_{i}"} for i in range(20)]}
+        rule = _parse_rule(config)
+        self.assertEqual(rule.at_least, 10)
+        self.assertEqual(rule.as_dict()["conditions"][0], {"field": "id_0", "block_on": []})
+        with self.assertRaisesRegex(ValueError, "too many combinations"):
+            _compile_exact_rule(rule, max_terms=10)
+
+    def test_exact_plan_expresses_sufficient_groups(self):
+        from transitive_fusion import _parse_rule, _compile_exact_rule
+        rule = _parse_rule(RuleAndReviewTests.rule)
+        plan = _compile_exact_rule(rule)
+        combinations = {tuple(c.field for c in group.conditions) for group in plan.groups}
+        self.assertEqual(combinations, {("ssn",), ("email", "license"),
+                                        ("email", "phone"), ("license", "phone")})
+        license_phone = next(g for g in plan.groups if tuple(c.field for c in g.conditions) == ("license", "phone"))
+        self.assertEqual(license_phone.columns, ("country", "license", "phone", "state"))
+        self.assertEqual(plan.rule.as_dict()["or"][1]["at_least"], 2)
+
+    def test_redundancy_keeps_referenced_columns_for_validation(self):
+        from transitive_fusion import _parse_rule, _compile_exact_rule
+        config = {"or": [{"field": "a"}, {"and": [{"field": "a"}, {"field": "b"}]}]}
+        plan = _compile_exact_rule(_parse_rule(config))
+        self.assertEqual(len(plan.groups), 1)
+        self.assertEqual(plan.groups[0].columns, ("a",))
+        self.assertEqual({leaf.field for leaf in plan.leaves}, {"a", "b"})
+        with self.assertRaisesRegex(ValueError, "missing match or blocker columns"):
+            cluster_entities(pl.DataFrame({"a": [1, 1]}), match_rule=config)
+
+    def test_compilation_bounds_duplicate_generation(self):
+        from transitive_fusion import _parse_rule, _compile_exact_rule
+        config = {"at_least": 3, "conditions": [
+            {"or": [{"field": "a"}, {"field": field}]} for field in ("b", "c", "d", "e")
+        ]}
+        with self.assertRaisesRegex(ValueError, "work limit"):
+            _compile_exact_rule(_parse_rule(config), max_work=20)
+        plan = _compile_exact_rule(_parse_rule(config))
+        self.assertEqual(len(plan.groups), 5)
+
+    def test_equivalent_conditions_still_rejected(self):
+        from transitive_fusion import _parse_rule, _compile_exact_rule
+        config = {"at_least": 2, "conditions": [
+            {"and": [{"field": "a"}, {"field": "b"}]},
+            {"at_least": 2, "conditions": [{"field": "b"}, {"field": "a"}]},
+        ]}
+        with self.assertRaisesRegex(ValueError, "duplicate conditions"):
+            _compile_exact_rule(_parse_rule(config))
+
+
 if __name__ == "__main__":
     unittest.main()
