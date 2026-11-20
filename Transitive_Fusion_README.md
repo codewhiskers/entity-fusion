@@ -1,5 +1,147 @@
 # Polars Transitive Entity Clustering
 
+## Dominant-Value Evaluation: Two DataFrames
+
+Use `fields` in `evaluate_clusters` for record-level review against each cluster's
+dominant field values. This mode returns **all input records and all clusters by
+default**, including singletons. It does not change membership or propose splits.
+
+```python
+from transitive_review import evaluate_clusters
+
+assessment = evaluate_clusters(
+    real_fusion,  # FusionResult, or a Polars DataFrame already containing cluster IDs
+    record_id_column="demo_record_id",
+    fields={
+        "BorrowerName": {"method": "tfidf", "threshold": 0.85},
+        "BorrowerAddress": {"method": "levenshtein", "threshold": 0.80},
+        "BorrowerState": {"method": "exact"},
+    },
+    # filing_count_column="filing total",  # sum a numeric count, if present
+    # filing_id_column="filing_id",         # optional alongside the count column
+)
+record_review, cluster_review = assessment
+```
+
+`assessment.records` and `.clusters` are the same two DataFrames; `.configuration`
+records the evaluation settings. For a plain DataFrame with a differently named
+cluster column, supply `cluster_id_column="entity_id"`. Record IDs must be unique
+and nonmissing; aggregate filing rows by record first or supply unique source-row
+IDs. IDs in these tables are standardized to `record_id` and `cluster_id`.
+
+### Record Review
+
+One row per input record, preserving input order:
+
+| Column | Meaning |
+|---|---|
+| `record_id`, `cluster_id` | Join keys into the original clustered records. |
+| `evaluated` | Whether the record's cluster was selected for scoring. |
+| `requires_review` | True if this record has any configured issue; null when not evaluated. |
+| `review_reasons` | Field-specific reasons such as `BorrowerName:below_threshold` or `ein:dominant_tie`. |
+| `<field>__value` | Original input value. |
+| `<field>__dominant_value` | Normalized reference value chosen for this cluster. |
+| `<field>__similarity` | Similarity to that reference (0–1), not a probability. |
+| `<field>__status` | `ok`, `below_threshold`, `missing`, `dominant_tie`, or `not_evaluated`. |
+| `<field>__requires_review` | Whether this specific field causes review. |
+| `<field>__distance` | Raw edit distance, included for Levenshtein fields only. |
+
+A record is flagged for its own field results, rather than inheriting every other
+member's issue. For example, with two identical names and one dissimilar name,
+only the dissimilar record fails the name threshold. Ambiguous reference ties
+can flag every record because no unique dominant value was established.
+
+```python
+annotations = record_review.select(
+    "record_id", "requires_review", "review_reasons",
+)
+enriched = real_fusion.records.join(
+    annotations.rename({"record_id": "demo_record_id"}),
+    on="demo_record_id", how="left", validate="1:1", maintain_order="left",
+)
+```
+
+### Cluster Review
+
+One row per cluster, sorted by record count descending and cluster ID ascending:
+
+| Column | Meaning |
+|---|---|
+| `record_count` | Number of unique input record IDs in the cluster. |
+| `total_filings` | Uses summed counts when a count column is configured; otherwise distinct filing IDs. Null when that source is missing. |
+| `summed_filing_count`, `distinct_filing_ids` | Separate totals for each configured source; both may be supplied together. |
+| `filing_counts_missing_count`, `filing_ids_missing_count` | Separate missing-data counts for the two sources. |
+| `filings_missing_count` | Number of records lacking the configured filing information. |
+| `review_record_count`, `requires_review`, `review_reasons` | Cluster-level rollup of individual record issues. |
+| `<field>__method`, `<field>__threshold` | How the field was evaluated. |
+| `<field>__dominant_value`, `__dominant_count`, `__dominant_fraction` | Reference and its count/share among nonmissing records. |
+| `<field>__dominant_tied`, `__distinct_values`, `__missing_count` | Reference ambiguity and data consistency. |
+| `<field>__compared_count`, `__below_threshold_count`, `__review_count` | Scoring coverage and field-specific issues. |
+| `<field>__mean_similarity`, `__min_similarity` | Cohesion against the reference, excluding unscored/missing values. |
+
+Supply a literal source name such as `filing_count_column="filing total"` for a
+per-record filing-count column. You may also supply `filing_id_column` in the same
+call. The two measures are never added together: summed counts include filings
+represented by the counts, while distinct IDs count only IDs actually present
+in that column. `total_filings` consistently uses the count source when configured,
+without falling back to ID counts for individual missing totals.
+
+Filings are independent of record counts and do **not** weight dominance. Null
+filing counts are excluded from sums and reported in `filings_missing_count`;
+partial totals should be interpreted with that count. Counts must be finite,
+nonnegative integers. Distinct-ID totals exclude null/blank IDs. No filing field
+is guessed automatically, and the local four-column PPP Parquet has none.
+
+### Field Policies And Dominance
+
+Each field supports `method`, `threshold`, `normalize`, `missing`, and
+`review_on_tie`:
+
+- `exact`: score 1 for equal normalized values, 0 otherwise; default threshold 1.
+- `tfidf`: character `char_wb` n-grams (2–4) and cosine similarity to the dominant
+  value; default threshold 0.85. The corpus is the **distinct normalized values**
+  in evaluated comparisons, unlike the legacy neighbor evaluator's record-weighted
+  corpus. Scores can therefore differ between the two modes.
+- `levenshtein`: score `1 - distance / max(length(value), length(reference))`, with
+  the raw distance also returned; default threshold 0.85. RapidFuzz accelerates
+  this when installed; a Python fallback produces the same distance.
+- `normalize=True` lowercases text and collapses/strips whitespace. Set it to
+  `False` for case-sensitive/raw comparisons. Nulls, NaNs, and whitespace-only
+  strings remain missing. Exact comparisons retain numeric/scalar field types.
+- `missing="review"` flags missing values by default. `missing="ignore"` retains
+  their missing status and null score without generating a missing-value flag.
+- `review_on_tie=True` flags tied dominant values. Ties choose the lowest sorted
+  normalized value for reproducibility and remain visible even if this flag is
+  disabled. A dominant value is the mode, not necessarily a strict majority.
+
+Dominance uses all records in each cluster, excluding missing values. A dominant
+value is a comparison reference, not proof that the majority is correct. Review
+thresholds and policies need to reflect the field's role and source quality.
+
+`max_clusters` and `min_cluster_size` can limit scoring, but **never drop rows** in
+this mode. Unselected rows remain with `evaluated=False`, null review flags and
+scores, and `not_evaluated` field statuses. Basic counts/dominant statistics still
+exist for every cluster. Without explicit limits, all records are evaluated.
+
+The existing `name_column=...` call still returns the legacy `NameReview` used by
+the graph dashboard and split workflow. It is also available explicitly as
+`evaluate_name_neighbors`. Do not combine `fields` with neighbor-specific
+parameters. The new two-table result is for dominant-value diagnostics; it does
+not silently generate neighbor graphs or name-based subgroup proposals.
+
+Try [examples/dominant_review.py](./examples/dominant_review.py):
+
+```bash
+python examples/dominant_review.py
+python examples/dominant_review.py --input test_data/100k.parquet --limit 100000
+```
+
+The notebook includes synthetic filing totals and a real-data two-table example.
+Outputs are written as Parquet plus JSON configuration. A local 100,000-row run
+with name TF-IDF and address Levenshtein took 3.85 seconds for evaluation and
+returned 100,000 record rows and 85,649 cluster rows. This is a different scoring
+policy from neighbor review; their flag counts are not directly comparable.
+
 ## Interactive Notebook
 
 Open [Test_Transitive_Fusion.ipynb](./Test_Transitive_Fusion.ipynb) and run cells

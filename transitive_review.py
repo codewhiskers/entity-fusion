@@ -106,6 +106,42 @@ class NameReview:
         return destination
 
 def evaluate_clusters(
+    result: FusionResult | pl.DataFrame, *, record_id_column: str,
+    fields: dict | None = None, cluster_id_column: str | None = None,
+    filing_count_column: str | None = None, filing_id_column: str | None = None,
+    name_column: str | None = None, threshold: float = .85, top_n: int = 10,
+    complete_limit: int = 100, min_cluster_size: int | None = None,
+    max_clusters: int | None = None,
+):
+    """Evaluate configurable fields against dominant values, or use legacy name review.
+
+    fields={"name": {"method": "tfidf", "threshold": .85}, ...} returns
+    ClusterEvaluation with .records and .clusters, unpackable as two DataFrames.
+    Every input record/cluster is returned; scope limits mark rows not evaluated.
+    Without fields, name_column selects the existing neighbor-based NameReview.
+    """
+    if fields is not None:
+        if name_column is not None or threshold != .85 or top_n != 10 or complete_limit != 100:
+            raise ValueError('fields mode uses per-field thresholds; do not combine it with name-neighbor options')
+        from cluster_evaluation import evaluate_dominant_values
+        return evaluate_dominant_values(
+            result, record_id_column=record_id_column, fields=fields,
+            cluster_id_column=cluster_id_column, filing_count_column=filing_count_column,
+            filing_id_column=filing_id_column, min_cluster_size=1 if min_cluster_size is None else min_cluster_size,
+            max_clusters=max_clusters,
+        )
+    if name_column is None:
+        raise ValueError('supply fields for dominant-value evaluation or name_column for name-neighbor review')
+    if cluster_id_column is not None or filing_count_column is not None or filing_id_column is not None:
+        raise ValueError('cluster_id_column and filing options require fields mode')
+    return evaluate_name_neighbors(
+        result, name_column=name_column, record_id_column=record_id_column, threshold=threshold,
+        top_n=top_n, complete_limit=complete_limit, min_cluster_size=2 if min_cluster_size is None else min_cluster_size,
+        max_clusters=max_clusters,
+    )
+
+
+def evaluate_name_neighbors(
     result: FusionResult, *, name_column: str, record_id_column: str,
     threshold: float = 0.85, top_n: int = 10, complete_limit: int = 100,
     min_cluster_size: int = 2, max_clusters: int | None = None,
